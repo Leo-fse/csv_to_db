@@ -1,0 +1,144 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+<additional_info>
+
+</additional_info>
+
+</file_summary>
+
+<directory_structure>
+.gitignore
+.python-version
+data/test1.csv
+main.py
+pyproject.toml
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="data/test1.csv">
+, 2000, 2003, 1175
+, Param_A, ParamB, -,
+, kg, mm, -
+2025/11/20 00:00:00    ,1,5,
+2025/11/20 00:00:01    ,0,10,
+2025/11/20 00:00:02    ,1,15,
+</file>
+
+<file path=".gitignore">
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+</file>
+
+<file path=".python-version">
+3.11
+</file>
+
+<file path="main.py">
+import polars as pl
+
+def infer_clean_column_names(path: str) -> list[str]:
+    with open(path, encoding="utf-8") as f:
+        header_lines = [line.strip().split(",") for _, line in zip(range(3), f)]
+
+    max_len = max(len(row) for row in header_lines)
+    for row in header_lines:
+        while len(row) < max_len:
+            row.append("")
+
+    columns = []
+    for i in range(max_len):
+        name = header_lines[1][i].strip()
+        unit = header_lines[2][i].strip()
+
+        # 2行目と3行目が両方 "-" の場合はスキップ
+        if name == "-" and unit == "-":
+            continue
+
+        # パーツを整形して結合（スペース除去、空除去）
+        parts = [header_lines[j][i].strip().replace(" ", "") for j in range(3) if header_lines[j][i].strip() not in ("", "-")]
+        clean_name = "_".join(parts)
+        columns.append((i, clean_name or f"column_{i}"))
+
+    return columns
+
+def main():
+    path = "./data/test1.csv"
+    indexed_columns = infer_clean_column_names(path)
+    
+    usecols = [index for index, _ in indexed_columns]
+    colnames = [name for _, name in indexed_columns]
+
+    df = pl.read_csv(
+        path,
+        skip_rows=3,
+        has_header=False,
+        columns=usecols,
+        new_columns=colnames,
+        try_parse_dates=True
+    )
+    print(df)
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="pyproject.toml">
+[project]
+name = "csv-to-db"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.2.1",
+    "polars>=1.26.0",
+]
+</file>
+
+</files>

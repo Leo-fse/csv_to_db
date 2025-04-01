@@ -121,7 +121,15 @@ class DataTransformer:
         header_rows = [line.split(',') for line in lines[:3]]
         
         # 各行の列数が一致していない場合は調整
+        # ただし空の要素が末尾にある場合は削除
+        for i in range(len(header_rows)):
+            # 末尾の空の要素を削除
+            while header_rows[i] and not header_rows[i][-1].strip():
+                header_rows[i].pop()
+        
+        # この時点でのヘッダー行の最大列数を取得
         max_cols = max(len(row) for row in header_rows)
+        
         for i in range(len(header_rows)):
             # 不足している列を空文字で埋める
             while len(header_rows[i]) < max_cols:
@@ -220,10 +228,18 @@ class DataTransformer:
             logger.warning(f"ファイル '{file_path}' の先頭3行が取得できません。形式不正の可能性。")
             return [], [], []
         
-        # カンマ区切りで分割
+        # カンマ区切りで分割し、各行を処理
         meta1 = [col.strip() for col in lines[0].split(',')]
         meta2 = [col.strip() for col in lines[1].split(',')]
         meta3 = [col.strip() for col in lines[2].split(',')]
+        
+        # 末尾の空の要素を削除
+        while meta1 and not meta1[-1]:
+            meta1.pop()
+        while meta2 and not meta2[-1]:
+            meta2.pop()
+        while meta3 and not meta3[-1]:
+            meta3.pop()
         
         return meta1, meta2, meta3
     
@@ -263,6 +279,18 @@ class DataTransformer:
         
         # カラム数チェック
         col_count = df.width
+        
+        # データ行の末尾の空の列を検出して除外する処理
+        # 最後の列が全て空であるかチェック
+        if col_count > len(meta1):
+            last_col = df.select(pl.col(df.columns[-1]))
+            # 最後の列が全て空または空白文字のみならば除外
+            if last_col.is_empty() or (last_col.cast(pl.Utf8).str.strip().is_empty().all()):
+                # 最後の列を除外
+                df = df.select(df.columns[:-1])
+                col_count = df.width
+                logger.info(f"データ行の末尾に余分なカンマが検出されたため、末尾の空の列を除外しました。")
+        
         # meta1,meta2,meta3は少なくともdfのカラム数と同じ以上の要素を含む必要がある（0列目=日付列+N列）
         if len(meta1) < col_count:
             logger.warning(f"ヘッダー列数({len(meta1)}) < 実データ列数({col_count})。一部列が対応付けできません。")

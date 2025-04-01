@@ -120,7 +120,7 @@ class DatabaseManager:
         self.conn.commit()
     
     def insert_sensor_data(self, lazy_df: pl.LazyFrame, file_info: Dict[str, Any]) -> int:
-        """センサーデータをDuckDBに格納する
+        """センサーデータをDuckDBに格納する（PyArrowを使用）
         
         Args:
             lazy_df: 変換済みのLazyFrame
@@ -141,31 +141,21 @@ class DatabaseManager:
             # データを収集
             df = lazy_df.collect()
             if df.shape[0] > 0:
-                # カラム名のリストを取得
-                column_names = df.columns
+                # PyArrowを使用してデータを転送
+                # Arrow形式に変換
+                arrow_table = df.to_arrow()
                 
-                # データを個別に挿入する
-                for i in range(df.shape[0]):
-                    row = df.row(i)
-                    # タプルから各カラムのインデックスを使って値を取得
-                    values = [
-                        row[column_names.index('file_path')],
-                        row[column_names.index('file_name')],
-                        row[column_names.index('zip_path')],
-                        row[column_names.index('load_timestamp')],
-                        row[column_names.index('timestamp')],
-                        row[column_names.index('sensor_id')],
-                        row[column_names.index('sensor_name')],
-                        row[column_names.index('unit')],
-                        float(row[column_names.index('value')]) if row[column_names.index('value')] is not None else None
-                    ]
-                    
-                    self.conn.execute("""
-                        INSERT INTO sensor_data (
-                            file_path, file_name, zip_path, load_timestamp,
-                            timestamp, sensor_id, sensor_name, unit, value
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, values)
+                # Arrowテーブルを一時テーブルとしてDuckDBに登録
+                self.conn.execute("CREATE TEMPORARY TABLE temp_sensor_data AS SELECT * FROM arrow_table")
+                
+                # メインテーブルに挿入
+                self.conn.execute("""
+                    INSERT INTO sensor_data
+                    SELECT * FROM temp_sensor_data
+                """)
+                
+                # 一時テーブル削除
+                self.conn.execute("DROP TABLE temp_sensor_data")
                 
                 self.conn.commit()
                 return df.shape[0]

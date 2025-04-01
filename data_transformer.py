@@ -22,6 +22,31 @@ class DataTransformer:
         """
         self.db_manager = db_manager
     
+    def _detect_encoding(self, file_path: str) -> str:
+        """CSVファイルのエンコーディングを検出する
+        
+        Args:
+            file_path: CSVファイルパス
+            
+        Returns:
+            検出されたエンコーディング（'shift-jis'または'utf-8'）
+        """
+        try:
+            # まずShift-JISとして読み込みを試みる
+            with open(file_path, 'r', encoding='shift-jis') as f:
+                f.read(100)
+            return 'shift-jis'
+        except UnicodeDecodeError:
+            # Shift-JISでエラーの場合はUTF-8を試す
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    f.read(100)
+                return 'utf-8'
+            except UnicodeDecodeError:
+                # デフォルトとしてShift-JISを返す
+                logger.warning(f"ファイル '{file_path}' のエンコーディングを検出できませんでした。Shift-JISとして処理します。")
+                return 'shift-jis'
+    
     def _read_csv_header(self, file_path: str) -> Tuple[List[str], Dict[str, Dict[str, str]]]:
         """CSVファイルのヘッダー行（3行）を読み込む
         
@@ -31,8 +56,12 @@ class DataTransformer:
         Returns:
             (カラム名リスト, センサー情報辞書)
         """
+        # ファイルのエンコーディングを検出
+        encoding = self._detect_encoding(file_path)
+        logger.info(f"ファイル '{file_path}' のエンコーディングを '{encoding}' として処理します。")
+        
         # ヘッダー3行を読み込む（区切り文字や不整合に対応）
-        header_df = pl.read_csv(file_path, n_rows=3, truncate_ragged_lines=True, separator=',')
+        header_df = pl.read_csv(file_path, n_rows=3, truncate_ragged_lines=True, separator=',', encoding=encoding)
         
         # カラム名（0列目は日時のため空欄になっている）
         columns = header_df.columns
@@ -76,6 +105,9 @@ class DataTransformer:
         # 有効なセンサーIDのみ抽出（センサー名と単位が両方「-」のカラムは除外）
         valid_columns = [''] + list(sensor_info.keys())  # 0列目（日時列）も含める
         
+        # エンコーディングを検出
+        encoding = self._detect_encoding(file_path)
+        
         # LazyFrameでCSVを読み込む（ヘッダー行をスキップ）
         lazy_df = pl.scan_csv(
             file_path,
@@ -84,7 +116,8 @@ class DataTransformer:
             new_columns=columns,
             separator=',',
             truncate_ragged_lines=True,
-            ignore_errors=True
+            ignore_errors=True,
+            encoding=encoding
         )
         
         # 有効なカラムのみ選択

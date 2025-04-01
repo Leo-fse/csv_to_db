@@ -111,15 +111,32 @@ def extract_from_zip(zip_path, file_path, output_dir):
 def setup_database(db_path):
     """DuckDBデータベースを初期化する"""
     conn = duckdb.connect(str(db_path))
+    
+    # processed_filesテーブルを作成し、file_hashに一意性制約を追加
     conn.execute("""
         CREATE TABLE IF NOT EXISTS processed_files (
-            file_path VARCHAR NOT NULL,,
-            file_hash VARCHAR NOT NULL,,
+            file_path VARCHAR NOT NULL,
+            file_hash VARCHAR NOT NULL,
             source_zip VARCHAR,
             processed_date TIMESTAMP,
             PRIMARY KEY (file_path, source_zip)
         )
     """)
+    
+    # file_hashに一意性インデックスが存在するか確認
+    result = conn.execute("""
+        SELECT COUNT(*) 
+        FROM duckdb_indexes() 
+        WHERE table_name = 'processed_files' AND index_name = 'idx_processed_files_hash'
+    """).fetchone()
+    
+    # インデックスが存在しない場合は作成
+    if result[0] == 0:
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_files_hash 
+            ON processed_files(file_hash)
+        """)
+    
     return conn
 
 def get_file_hash(file_path):
@@ -131,14 +148,22 @@ def get_file_hash(file_path):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
 
-def is_file_processed(conn, file_path, source_zip=None):
-    """ファイルが既に処理済みかどうかを確認する"""
+def is_file_processed_by_path(conn, file_path, source_zip=None):
+    """ファイルパスに基づいて処理済みかどうかを確認する"""
     source_zip_value = "" if source_zip is None else str(source_zip)
     result = conn.execute(
-            "SELECT COUNT(*) FROM processed_files WHERE file_path = ? AND source_zip = ?",
-            [str(file_path), source_zip]
-        ).fetchone()
+        "SELECT COUNT(*) FROM processed_files WHERE file_path = ? AND source_zip = ?",
+        [str(file_path), source_zip_value]
+    ).fetchone()
+    
+    return result[0] > 0
 
+def is_file_processed_by_hash(conn, file_hash):
+    """ファイルハッシュに基づいて処理済みかどうかを確認する"""
+    result = conn.execute(
+        "SELECT COUNT(*) FROM processed_files WHERE file_hash = ?",
+        [file_hash]
+    ).fetchone()
     
     return result[0] > 0
 
@@ -146,10 +171,15 @@ def mark_file_as_processed(conn, file_path, file_hash, source_zip=None):
     """ファイルを処理済みとしてデータベースに記録する"""
     now = datetime.datetime.now()
     source_zip_value = "" if source_zip is None else str(source_zip)
-    conn.execute(
-        "INSERT INTO processed_files (file_path, file_hash, source_zip, processed_date) VALUES (?, ?, ?, ?)",
-        [str(file_path), file_hash, source_zip, now]
-    )
+    
+    # UPSERTパターンを使用して挿入（一意制約違反を防ぐ）
+    try:
+        conn.execute("""
+            INSERT INTO processed_files (file_path, file_hash, source_zip, processed_date) 
+            VALUES (?, ?, ?, ?)
+        """, [str(file_path), file_hash, source_zip_value, now])
+    except duckdb.ConstraintException:
+        print(f"  情報: 同一ハッシュ({file_hash})のファイルが既に処理済みです")
 
 # ====== 処理実行部分 ======
 
@@ -189,7 +219,8 @@ def process_csv_files(csv_files, db_path, process_all=False):
     # 結果統計
     stats = {
         "total_found": len(csv_files),
-        "already_processed": 0,
+        "already_processed_by_path": 0,
+        "already_processed_by_hash": 0,
         "newly_processed": 0,
         "failed": 0
     }
@@ -204,11 +235,12 @@ def process_csv_files(csv_files, db_path, process_all=False):
         for file_info in csv_files:
             file_path = file_info['path']
             source_zip = file_info['source_zip']
+            source_zip_str = str(source_zip) if source_zip else None
             
-            # 既に処理済みかチェック
-            if not process_all and is_file_processed(conn, file_path, str(source_zip) if source_zip else None):
-                stats["already_processed"] += 1
-                print(f"スキップ (既処理): {file_path}" + (f" (in {source_zip})" if source_zip else ""))
+            # パスベースで既に処理済みかチェック
+            if not process_all and is_file_processed_by_path(conn, file_path, source_zip_str):
+                stats["already_processed_by_path"] += 1
+                print(f"スキップ (既処理 - パス一致): {file_path}" + (f" (in {source_zip})" if source_zip else ""))
                 continue
             
             try:
@@ -219,16 +251,19 @@ def process_csv_files(csv_files, db_path, process_all=False):
                 else:
                     actual_file_path = file_path
                 
+                # ファイルハッシュを計算
+                file_hash = get_file_hash(actual_file_path)
+                
+                # ハッシュベースで既に処理済みかチェック
+                if not process_all and is_file_processed_by_hash(conn, file_hash):
+                    stats["already_processed_by_hash"] += 1
+                    print(f"スキップ (既処理 - 内容一致): {file_path}" + (f" (in {source_zip})" if source_zip else ""))
+                    continue
+                
                 # ファイルを処理
                 if process_csv_file(actual_file_path):
-                    # ハッシュを計算して処理済みとマーク
-                    file_hash = get_file_hash(actual_file_path)
-                    mark_file_as_processed(
-                        conn, 
-                        file_path, 
-                        file_hash, 
-                        str(source_zip) if source_zip else None
-                    )
+                    # 処理済みとマーク
+                    mark_file_as_processed(conn, file_path, file_hash, source_zip_str)
                     stats["newly_processed"] += 1
                 else:
                     stats["failed"] += 1
@@ -270,17 +305,22 @@ def main(folder_path, pattern, db_path, process_all=False):
     # 結果の表示
     print("\n---- 処理結果 ----")
     print(f"見つかったファイル数: {stats['total_found']}")
-    print(f"既に処理済み: {stats['already_processed']}")
+    print(f"パスで既に処理済み: {stats['already_processed_by_path']}")
+    print(f"内容が同一で処理済み: {stats['already_processed_by_hash']}")
     print(f"新たに処理: {stats['newly_processed']}")
     print(f"処理失敗: {stats['failed']}")
 
 # 使用例
 if __name__ == "__main__":
-    folder_path = "検索したいフォルダのパス"  # ここに実際のフォルダパスを入力
-    db_path = "processed_files.duckdb"        # DuckDBデータベースのパス
+    import argparse
     
-    # "Cond"または"User"を含むファイル名の正規表現パターン
-    pattern = r"(Cond|User)"
+    parser = argparse.ArgumentParser(description="CSVファイル処理ツール")
+    parser.add_argument("--folder", type=str, default="data", help="検索対象のフォルダパス")
+    parser.add_argument("--pattern", type=str, default=r"(Cond|User)", help="ファイル名フィルタリングのための正規表現パターン")
+    parser.add_argument("--db", type=str, default="processed_files.duckdb", help="処理記録用データベースファイルのパス")
+    parser.add_argument("--process-all", action="store_true", help="処理済みファイルも再処理する場合に指定")
+    
+    args = parser.parse_args()
     
     # 処理実行
-    main(folder_path, pattern, db_path, process_all=False)
+    main(args.folder, args.pattern, args.db, args.process_all)

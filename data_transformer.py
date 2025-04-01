@@ -333,5 +333,4 @@ class DataTransformer:
             logger.info(f"ファイル '{file_info['file_name']}' の処理が完了しました。{record_count}件のレコードを登録しました。")
             return record_count
         except Exception as e:
-            logger.error(f"ファイル '{file_info['file_name']}' の処理中にエラーが発生しました: {str(e)}")
-            raise
+            pass

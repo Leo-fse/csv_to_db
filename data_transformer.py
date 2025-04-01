@@ -189,7 +189,8 @@ class DataTransformer:
                             'zip_path': file_info.get('zip_path', None)
                         })
                     except ValueError:
-                        logger.warning(f"数値に変換できない値: {cols[col_idx]}")
+                        # 文字列値の場合は警告せずにスキップ
+                        pass
         
         return results
     
@@ -245,29 +246,86 @@ class DataTransformer:
                 WHERE file_path = ?
             """, [file_info["file_path"]])
             
-            # 変換結果をDuckDBに直接挿入
+            # 変換結果をDuckDBに直接挿入（重複キーを避けるため一時テーブルを使用）
             record_count = 0
             if transformed_records:
-                for record in transformed_records:
-                    self.db_manager.conn.execute("""
-                        INSERT INTO sensor_data (
-                            timestamp, sensor_id, sensor_name, unit, value,
-                            file_path, file_name, load_timestamp, zip_path
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, [
-                        record['timestamp'],
-                        record['sensor_id'],
-                        record['sensor_name'],
-                        record['unit'],
-                        record['value'],
-                        record['file_path'],
-                        record['file_name'],
-                        record['load_timestamp'],
-                        record['zip_path']
-                    ])
-                    record_count += 1
-                
-                self.db_manager.conn.commit()
+                # 一時テーブルの作成（一意の名前を使用）
+                temp_table_name = f"temp_sensor_data_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+                try:
+                    # 一時テーブルの作成
+                    self.db_manager.conn.execute(f"""
+                        CREATE TEMPORARY TABLE {temp_table_name} (
+                            timestamp TIMESTAMP,
+                            sensor_id TEXT,
+                            sensor_name TEXT,
+                            unit TEXT,
+                            value DOUBLE,
+                            file_path TEXT,
+                            file_name TEXT,
+                            load_timestamp TIMESTAMP,
+                            zip_path TEXT
+                        )
+                    """)
+                    
+                    # 一時テーブルにデータを挿入
+                    for record in transformed_records:
+                        self.db_manager.conn.execute(f"""
+                            INSERT INTO {temp_table_name} (
+                                timestamp, sensor_id, sensor_name, unit, value,
+                                file_path, file_name, load_timestamp, zip_path
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, [
+                            record['timestamp'],
+                            record['sensor_id'],
+                            record['sensor_name'],
+                            record['unit'],
+                            record['value'],
+                            record['file_path'],
+                            record['file_name'],
+                            record['load_timestamp'],
+                            record['zip_path']
+                        ])
+                    
+                    # 一時テーブルから一意のレコードのみをメインテーブルに挿入
+                    # GROUP BYを使用して重複を排除
+                    # レコード数を事前に取得
+                    record_count_result = self.db_manager.conn.execute(f"""
+                        SELECT COUNT(*) FROM (
+                            SELECT 
+                                timestamp, 
+                                sensor_id, 
+                                file_path
+                            FROM {temp_table_name}
+                            GROUP BY timestamp, sensor_id, file_path
+                        )
+                    """).fetchone()
+                    record_count = record_count_result[0] if record_count_result else 0
+                    
+                    # 一意のレコードをメインテーブルに挿入
+                    self.db_manager.conn.execute(f"""
+                        INSERT INTO sensor_data
+                        SELECT 
+                            timestamp, 
+                            sensor_id, 
+                            MAX(sensor_name) as sensor_name,
+                            MAX(unit) as unit, 
+                            MAX(value) as value,
+                            file_path, 
+                            MAX(file_name) as file_name, 
+                            MAX(load_timestamp) as load_timestamp, 
+                            MAX(zip_path) as zip_path
+                        FROM {temp_table_name}
+                        GROUP BY timestamp, sensor_id, file_path
+                    """)
+                    
+                    self.db_manager.conn.commit()
+                    
+                finally:
+                    # 一時テーブルを削除（エラーが発生しても削除を試みる）
+                    try:
+                        self.db_manager.conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
+                    except Exception as e:
+                        logger.warning(f"一時テーブル削除中にエラーが発生しました: {str(e)}")
             
             # 処理済みファイル情報を登録
             self.db_manager.insert_processed_file(file_info)

@@ -1,405 +1,286 @@
-"""
-センサーデータCSVファイルを読み込み、DuckDBデータベースに変換するプログラム
-
-特徴:
-- Shift-JISエンコードのCSVファイル対応
-- 3行ヘッダー形式（センサーID、センサー名、単位）の処理
-- 末尾カンマの処理
-- ZIPファイル内のCSVファイル対応
-- ファイル名パターンによるフィルタリング
-- 処理済みファイルのスキップ
-- 縦持ちデータ形式への変換
-
-使用方法:
-python main.py --csv_path data --plant_name Plant1 --machine_no Machine1 --file_pattern "Cond|User"
-"""
-
-import os
+from pathlib import Path
 import re
 import zipfile
-import io
-import argparse
-from datetime import datetime
-import polars as pl
+import tempfile
+import os
 import duckdb
+import hashlib
+import datetime
+import shutil
 
+# ====== ファイル抽出部分 ======
 
-def parse_args():
-    """コマンドライン引数を解析する"""
-    parser = argparse.ArgumentParser(description="CSVセンサーデータをDuckDBに変換")
-    parser.add_argument('--csv_path', type=str, default='data',
-                        help='CSVファイルのあるディレクトリ')
-    parser.add_argument('--plant_name', type=str, required=True,
-                        help='プラント名')
-    parser.add_argument('--machine_no', type=str, required=True,
-                        help='機器番号')
-    parser.add_argument('--file_pattern', type=str, default='Cond|User',
-                        help='ファイル名フィルタリングのための正規表現パターン（デフォルト: "Cond|User"）')
-    return parser.parse_args()
-
-
-def get_target_files(base_dir, pattern):
+def find_csv_files(folder_path, pattern):
     """
-    通常のCSVファイルとZIPファイル内のCSVファイルをリストアップ
+    フォルダ内およびZIPファイル内から正規表現パターンに一致するCSVファイルを抽出する
     
-    Args:
-        base_dir: 基本ディレクトリ
-        pattern: ファイル名のフィルタリングパターン（正規表現）
+    Parameters:
+    folder_path (str or Path): 検索対象のフォルダパス
+    pattern (str): 正規表現パターン
     
     Returns:
-        処理対象ファイルのリスト（パスとZIP内パスの組み合わせ）
+    list: [{'path': ファイルパス, 'source_zip': ZIPファイルパス（ない場合はNone）}]
     """
-    target_files = []
-    pattern_regex = re.compile(pattern)
+    found_files = []
     
-    # ディレクトリ内の全ファイルを走査
-    for root, _, files in os.walk(base_dir):
-        for filename in files:
-            file_path = os.path.join(root, filename)
-            
-            # ZIPファイルの場合
-            if filename.lower().endswith('.zip'):
-                try:
-                    with zipfile.ZipFile(file_path, 'r') as zip_ref:
-                        for zip_info in zip_ref.infolist():
-                            # ZIPファイル内のCSVファイルをチェック
-                            if zip_info.filename.lower().endswith('.csv'):
-                                # パターンに一致するかチェック
-                                if pattern_regex.search(os.path.basename(zip_info.filename)):
-                                    target_files.append({
-                                        'type': 'zip',
-                                        'zip_path': file_path,
-                                        'inner_path': zip_info.filename,
-                                        'full_path': f"{file_path}:{zip_info.filename}"
-                                    })
-                except Exception as e:
-                    print(f"警告: ZIPファイルの読み込みエラー {file_path}: {e}")
-            
-            # 通常のCSVファイルの場合
-            elif filename.lower().endswith('.csv'):
-                # パターンに一致するかチェック
-                if pattern_regex.search(filename):
-                    target_files.append({
-                        'type': 'normal',
-                        'full_path': file_path
-                    })
+    # Pathオブジェクトへ変換
+    folder = Path(folder_path)
     
-    return target_files
-
-
-def read_csv_headers(content_lines):
-    """
-    CSVファイルの最初の3行からヘッダー情報を抽出
+    # コンパイル済み正規表現パターン
+    regex = re.compile(pattern)
     
-    Args:
-        content_lines: CSVファイルの行のリスト
+    # 通常のCSVファイルを検索
+    for file in folder.rglob("*.csv"):
+        if regex.search(file.name):
+            found_files.append({
+                'path': file,
+                'source_zip': None
+            })
     
-    Returns:
-        (sensor_ids, sensor_names, sensor_units)のタプル
-    """
-    if len(content_lines) < 3:
-        raise ValueError("CSVファイルは少なくとも3行のヘッダーが必要です")
-    
-    # 各行を解析（最初の列と末尾の余分な列を除外）
-    sensor_ids = content_lines[0].strip().split(',')
-    sensor_names = content_lines[1].strip().split(',')
-    sensor_units = content_lines[2].strip().split(',')
-    
-    # 最初の列（時間列のヘッダー）を除外
-    sensor_ids = sensor_ids[1:]
-    sensor_names = sensor_names[1:]
-    sensor_units = sensor_units[1:]
-    
-    # 末尾の余分なカンマを処理（空の要素を削除）
-    if sensor_ids and sensor_ids[-1] == '':
-        sensor_ids = sensor_ids[:-1]
-    if sensor_names and sensor_names[-1] == '':
-        sensor_names = sensor_names[:-1]
-    if sensor_units and sensor_units[-1] == '':
-        sensor_units = sensor_units[:-1]
-    
-    # 各値の前後の空白を削除
-    sensor_ids = [sid.strip() for sid in sensor_ids]
-    sensor_names = [name.strip() for name in sensor_names]
-    sensor_units = [unit.strip() for unit in sensor_units]
-    
-    return sensor_ids, sensor_names, sensor_units
-
-
-def read_csv_file(file_info):
-    """
-    通常のCSVファイルまたはZIP内のCSVファイルを読み込む
-    
-    Args:
-        file_info: ファイル情報の辞書
-    
-    Returns:
-        (sensor_ids, sensor_names, sensor_units, data_df)のタプル
-    """
-    try:
-        if file_info['type'] == 'normal':
-            # 通常のファイルの場合
-            file_path = file_info['full_path']
-            
-            # ヘッダー3行を別々に読み込む
-            with open(file_path, 'r', encoding='shift-jis') as f:
-                content_lines = f.readlines()
-                sensor_ids, sensor_names, sensor_units = read_csv_headers(content_lines)
-            
-            # データ部分（4行目以降）を読み込む
-            data_df = pl.read_csv(
-                file_path,
-                encoding="shift-jis",
-                skip_rows=3,
-                has_header=False,
-                truncate_ragged_lines=True
-            )
-        
-        else:  # 'zip'の場合
-            # ZIPファイル内のCSVを読み込む
-            with zipfile.ZipFile(file_info['zip_path'], 'r') as zip_ref:
-                with zip_ref.open(file_info['inner_path']) as csv_file:
-                    # ZIPからバイナリとして読み込んでデコード
-                    content = csv_file.read().decode('shift-jis')
-                    content_lines = content.splitlines()
-                    
-                    # ヘッダー3行を解析
-                    sensor_ids, sensor_names, sensor_units = read_csv_headers(content_lines)
-                    
-                    # データ部分をPolarsで読み込む
-                    data_content = '\n'.join(content_lines[3:])
-                    data_df = pl.read_csv(
-                        io.StringIO(data_content),
-                        has_header=False,
-                        truncate_ragged_lines=True
-                    )
-        
-        # 余分な列を削除（末尾カンマによる）
-        if data_df.shape[1] > len(sensor_ids) + 1:
-            data_df = data_df.drop(data_df.columns[-1])
-        
-        # 列名を設定（1列目は時間、残りはセンサー値）
-        data_df.columns = ["timestamp"] + [f"value_{i}" for i in range(len(sensor_ids))]
-        
-        return sensor_ids, sensor_names, sensor_units, data_df
-    
-    except Exception as e:
-        raise ValueError(f"CSVファイルの読み込みエラー: {e}")
-
-
-def is_file_processed(conn, file_info):
-    """
-    ファイルが既に処理済みかチェック
-    
-    Args:
-        conn: DuckDB接続
-        file_info: ファイル情報の辞書
-    
-    Returns:
-        処理済みならTrue、そうでなければFalse
-    """
-    # ZIPファイルの場合はZIPパスと内部パスの組み合わせをキーとする
-    file_path = file_info['full_path']
-    
-    result = conn.execute("""
-        SELECT 1 FROM processed_files
-        WHERE file_path = ?
-    """, [file_path]).fetchone()
-    
-    return result is not None
-
-
-def mark_file_as_processed(conn, file_info):
-    """
-    ファイルを処理済みとマーク
-    
-    Args:
-        conn: DuckDB接続
-        file_info: ファイル情報の辞書
-    """
-    file_path = file_info['full_path']
-    
-    conn.execute("""
-        INSERT INTO processed_files (file_path, processed_at)
-        VALUES (?, CURRENT_TIMESTAMP)
-    """, [file_path])
-
-
-def convert_to_vertical_df(data_df, sensor_ids, sensor_names, sensor_units, plant_name, machine_no):
-    """
-    センサーデータを縦持ちデータフレームに変換
-    
-    Args:
-        data_df: センサーデータのデータフレーム
-        sensor_ids: センサーID配列
-        sensor_names: センサー名配列
-        sensor_units: センサー単位配列
-        plant_name: プラント名
-        machine_no: 機器番号
-    
-    Returns:
-        縦持ちデータフレーム
-    """
-    vertical_data = []
-    
-    for i in range(len(sensor_ids)):
-        sensor_id = sensor_ids[i]
-        sensor_name = sensor_names[i]
-        sensor_unit = sensor_units[i]
-        
-        # 不要センサーのスキップ
-        if sensor_name == "-" and sensor_unit == "-":
-            continue
-        
-        # 値の列インデックス
-        value_col = f"value_{i}"
-        
-        # 縦持ちデータ作成
+    # ZIPファイルを検索して中身を確認
+    for zip_file in folder.rglob("*.zip"):
         try:
-            # すべての値を文字列として扱うことで型の互換性問題を回避
-            sensor_df = data_df.select([
-                pl.lit(plant_name).alias("plant_name"),
-                pl.lit(machine_no).alias("machine_no"),
-                pl.col("timestamp"),
-                pl.lit(sensor_id).alias("sensor_id"),
-                pl.lit(sensor_name).alias("sensor_name"),
-                pl.lit(sensor_unit).alias("sensor_unit"),
-                pl.col(value_col).cast(pl.Utf8).alias("value")  # すべての値を文字列に変換
-            ])
-            vertical_data.append(sensor_df)
-        except Exception as e:
-            print(f"警告: センサーID:{sensor_id}, 名前:{sensor_name}の処理中にエラーが発生しました: {e}")
+            with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+                # ZIPファイル内のファイル一覧を取得
+                zip_contents = zip_ref.namelist()
+                
+                # CSVファイルかつ条件に合うものを抽出
+                for file_in_zip in zip_contents:
+                    if file_in_zip.endswith('.csv') and regex.search(Path(file_in_zip).name):
+                        found_files.append({
+                            'path': file_in_zip,
+                            'source_zip': zip_file
+                        })
+        except zipfile.BadZipFile:
+            print(f"警告: {zip_file}は有効なZIPファイルではありません。")
     
-    # 全センサーデータの結合
-    if not vertical_data:
-        return None
-    
-    return pl.concat(vertical_data)
+    return found_files
 
-
-def init_database(db_path):
+def extract_from_zip(zip_path, file_path, output_dir):
     """
-    データベースの初期化
+    ZIPファイルから特定のファイルを抽出する（改良版）
     
-    Args:
-        db_path: データベースファイルのパス
+    Parameters:
+    zip_path (str or Path): ZIPファイルのパス
+    file_path (str): 抽出するファイルのZIP内パス
+    output_dir (str or Path): 出力先ディレクトリ
     
     Returns:
-        DuckDB接続オブジェクト
+    Path: 抽出されたファイルのパス
     """
-    conn = duckdb.connect(db_path)
+    # 出力ディレクトリの確認と作成
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
-    # テーブル作成（初回のみ）
-    conn.execute("""
-        CREATE SEQUENCE IF NOT EXISTS sensor_id_seq;
+    # ZIPファイルを開いて処理
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        # ZIPファイル内のファイルパスを正規化
+        normalized_path = file_path.replace('\\', '/')
         
-        CREATE TABLE IF NOT EXISTS sensor_data (
-            id INTEGER DEFAULT(nextval('sensor_id_seq')),
-            plant_name VARCHAR,
-            machine_no VARCHAR,
-            time TIMESTAMP,
-            sensor_id VARCHAR,
-            sensor_name VARCHAR,
-            sensor_unit VARCHAR,
-            value VARCHAR,  -- 数値か文字列かに応じて柔軟に対応する文字列型
-            PRIMARY KEY(id)
-        )
-    """)
-    
+        # ファイル名のみを取得
+        file_name = Path(normalized_path).name
+        
+        # 出力先のフルパス
+        output_path = output_dir / file_name
+        
+        # ファイルを抽出
+        try:
+            # まずそのままのパスで試す
+            zip_ref.extract(normalized_path, output_dir)
+            # 階層構造があればそのファイルへのフルパスを返す
+            if '/' in normalized_path:
+                return output_dir / normalized_path
+            return output_path
+        except KeyError:
+            # 正確なパスでなければ、ファイル名でマッチするものを探す
+            for zip_info in zip_ref.infolist():
+                zip_file_path = zip_info.filename.replace('\\', '/')
+                if zip_file_path.endswith('/' + file_name) or zip_file_path == file_name:
+                    # 見つかったファイルを抽出
+                    zip_ref.extract(zip_info, output_dir)
+                    # 抽出されたファイルのパスを返す
+                    if '/' in zip_info.filename:
+                        return output_dir / zip_info.filename
+                    return output_dir / file_name
+            
+            # ファイルが見つからない場合はエラー
+            raise FileNotFoundError(f"ZIPファイル内に {file_path} または {file_name} が見つかりません。")
+
+# ====== データベース管理部分 ======
+
+def setup_database(db_path):
+    """DuckDBデータベースを初期化する"""
+    conn = duckdb.connect(str(db_path))
     conn.execute("""
         CREATE TABLE IF NOT EXISTS processed_files (
-            file_path VARCHAR PRIMARY KEY,
-            processed_at TIMESTAMP
+            file_path VARCHAR NOT NULL,,
+            file_hash VARCHAR NOT NULL,,
+            source_zip VARCHAR,
+            processed_date TIMESTAMP,
+            PRIMARY KEY (file_path, source_zip)
         )
     """)
-    
     return conn
 
+def get_file_hash(file_path):
+    """ファイルのSHA256ハッシュを計算する"""
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        # ファイルを小さなチャンクで読み込んでハッシュ計算
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
 
-def main():
-    """メイン処理"""
-    # コマンドライン引数の解析
-    args = parse_args()
+def is_file_processed(conn, file_path, source_zip=None):
+    """ファイルが既に処理済みかどうかを確認する"""
+    source_zip_value = "" if source_zip is None else str(source_zip)
+    result = conn.execute(
+            "SELECT COUNT(*) FROM processed_files WHERE file_path = ? AND source_zip = ?",
+            [str(file_path), source_zip]
+        ).fetchone()
+
     
-    print(f"開始: {datetime.now()}")
-    print(f"ディレクトリ: {args.csv_path}")
-    print(f"プラント名: {args.plant_name}")
-    print(f"機器番号: {args.machine_no}")
-    print(f"ファイルパターン: {args.file_pattern}")
+    return result[0] > 0
+
+def mark_file_as_processed(conn, file_path, file_hash, source_zip=None):
+    """ファイルを処理済みとしてデータベースに記録する"""
+    now = datetime.datetime.now()
+    source_zip_value = "" if source_zip is None else str(source_zip)
+    conn.execute(
+        "INSERT INTO processed_files (file_path, file_hash, source_zip, processed_date) VALUES (?, ?, ?, ?)",
+        [str(file_path), file_hash, source_zip, now]
+    )
+
+# ====== 処理実行部分 ======
+
+def process_csv_file(file_path):
+    """
+    CSVファイルを処理する関数（実際の処理はここに実装）
+    
+    Parameters:
+    file_path (Path): 処理するCSVファイルのパス
+    
+    Returns:
+    bool: 処理が成功したかどうか
+    """
+    print(f"処理中: {file_path}")
+    
+    # ここに実際のCSV処理ロジックを実装する
+    # 例: pandas でCSVを読み込んで何らかの処理を行う
+    # import pandas as pd
+    # df = pd.read_csv(file_path)
+    # ... 処理 ...
+    
+    # 処理が成功したことを示す（実際の実装に応じて変更）
+    return True
+
+def process_csv_files(csv_files, db_path, process_all=False):
+    """
+    CSVファイルのリストを処理する
+    
+    Parameters:
+    csv_files (list): 処理するCSVファイルのリスト
+    db_path (str or Path): DuckDBデータベースのパス
+    process_all (bool): 処理済みファイルも再処理するかどうか
+    
+    Returns:
+    dict: 処理結果の統計情報
+    """
+    # 結果統計
+    stats = {
+        "total_found": len(csv_files),
+        "already_processed": 0,
+        "newly_processed": 0,
+        "failed": 0
+    }
     
     # データベース接続
-    conn = init_database("sensor_data.duckdb")
+    conn = setup_database(db_path)
     
-    # 処理対象ファイルのリストを取得
-    target_files = get_target_files(args.csv_path, args.file_pattern)
+    # 一時ディレクトリを作成
+    temp_dir = Path(tempfile.mkdtemp())
     
-    print(f"{len(target_files)}個のファイルが処理対象として見つかりました")
-    
-    # 処理済みファイル数と新規処理ファイル数のカウンタ
-    processed_count = 0
-    skipped_count = 0
-    
-    # 各ファイルを処理
-    for file_info in target_files:
-        file_path = file_info['full_path']
-        
-        # 既に処理済みかチェック
-        if is_file_processed(conn, file_info):
-            print(f"スキップ: {file_path} (既に処理済み)")
-            skipped_count += 1
-            continue
-        
-        print(f"処理中: {file_path}")
-        
-        try:
-            # ファイル読み込み
-            sensor_ids, sensor_names, sensor_units, data_df = read_csv_file(file_info)
+    try:
+        for file_info in csv_files:
+            file_path = file_info['path']
+            source_zip = file_info['source_zip']
             
-            # 縦持ちデータに変換
-            result_df = convert_to_vertical_df(
-                data_df, sensor_ids, sensor_names, sensor_units, 
-                args.plant_name, args.machine_no
-            )
+            # 既に処理済みかチェック
+            if not process_all and is_file_processed(conn, file_path, str(source_zip) if source_zip else None):
+                stats["already_processed"] += 1
+                print(f"スキップ (既処理): {file_path}" + (f" (in {source_zip})" if source_zip else ""))
+                continue
             
-            if result_df is not None and len(result_df) > 0:
-                # タイムスタンプの変換
-                try:
-                    result_df = result_df.with_columns(
-                        pl.col("timestamp").str.to_datetime("%Y/%m/%d %H:%M:%S").alias("time")
-                    ).drop("timestamp")
-                except Exception as e:
-                    print(f"  警告: タイムスタンプ変換エラー: {e}")
-                    result_df = result_df.rename({"timestamp": "time"})
+            try:
+                # ZIPファイル内のファイルなら抽出
+                if source_zip:
+                    # 一時ファイルにZIPから抽出
+                    actual_file_path = extract_from_zip(source_zip, file_path, temp_dir)
+                else:
+                    actual_file_path = file_path
                 
-                # データの挿入（IDは自動生成させる）
-                conn.execute("""
-                    INSERT INTO sensor_data (plant_name, machine_no, time, sensor_id, sensor_name, sensor_unit, value)
-                    SELECT plant_name, machine_no, time, sensor_id, sensor_name, sensor_unit, value 
-                    FROM result_df
-                """)
-                
-                row_count = len(result_df)
-                print(f"  {row_count}行のデータを挿入しました")
-                
-                # 処理済みマーク
-                mark_file_as_processed(conn, file_info)
-                processed_count += 1
-            else:
-                print(f"  処理可能なセンサーデータが見つかりませんでした")
-            
-        except Exception as e:
-            print(f"エラー: {file_path} の処理中にエラーが発生しました: {e}")
+                # ファイルを処理
+                if process_csv_file(actual_file_path):
+                    # ハッシュを計算して処理済みとマーク
+                    file_hash = get_file_hash(actual_file_path)
+                    mark_file_as_processed(
+                        conn, 
+                        file_path, 
+                        file_hash, 
+                        str(source_zip) if source_zip else None
+                    )
+                    stats["newly_processed"] += 1
+                else:
+                    stats["failed"] += 1
+            except Exception as e:
+                print(f"エラー処理中 {file_path}" + (f" (in {source_zip})" if source_zip else "") + f": {str(e)}")
+                stats["failed"] += 1
     
-    # 接続を閉じる
-    conn.close()
+    finally:
+        # 一時ディレクトリを削除
+        shutil.rmtree(temp_dir)
+        
+        # データベース接続をコミットして閉じる
+        conn.commit()
+        conn.close()
     
-    print("\n処理サマリ:")
-    print(f"- 処理対象ファイル数: {len(target_files)}")
-    print(f"- 処理済みファイル数: {processed_count}")
-    print(f"- スキップされたファイル数: {skipped_count}")
-    print(f"- エラーファイル数: {len(target_files) - processed_count - skipped_count}")
-    print(f"\n完了: {datetime.now()}")
+    return stats
 
+# ====== メイン実行部分 ======
 
+def main(folder_path, pattern, db_path, process_all=False):
+    """
+    メイン実行関数
+    
+    Parameters:
+    folder_path (str or Path): 検索対象のフォルダパス
+    pattern (str): 正規表現パターン
+    db_path (str or Path): DuckDBデータベースのパス
+    process_all (bool): 処理済みファイルも再処理するかどうか
+    """
+    # ファイル検索（抽出部分）
+    print(f"フォルダ {folder_path} から条件に合うCSVファイルを検索中...")
+    csv_files = find_csv_files(folder_path, pattern)
+    print(f"{len(csv_files)}件のファイルが見つかりました")
+    
+    # ファイル処理（処理部分）
+    print("CSVファイルの処理を開始します...")
+    stats = process_csv_files(csv_files, db_path, process_all)
+    
+    # 結果の表示
+    print("\n---- 処理結果 ----")
+    print(f"見つかったファイル数: {stats['total_found']}")
+    print(f"既に処理済み: {stats['already_processed']}")
+    print(f"新たに処理: {stats['newly_processed']}")
+    print(f"処理失敗: {stats['failed']}")
+
+# 使用例
 if __name__ == "__main__":
-    main()
+    folder_path = "検索したいフォルダのパス"  # ここに実際のフォルダパスを入力
+    db_path = "processed_files.duckdb"        # DuckDBデータベースのパス
+    
+    # "Cond"または"User"を含むファイル名の正規表現パターン
+    pattern = r"(Cond|User)"
+    
+    # 処理実行
+    main(folder_path, pattern, db_path, process_all=False)

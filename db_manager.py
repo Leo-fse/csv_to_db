@@ -145,17 +145,22 @@ class DatabaseManager:
                 # Arrow形式に変換
                 arrow_table = df.to_arrow()
                 
-                # Arrowテーブルを一時テーブルとしてDuckDBに登録
-                self.conn.execute("CREATE TEMPORARY TABLE temp_sensor_data AS SELECT * FROM arrow_table")
-                
-                # メインテーブルに挿入
-                self.conn.execute("""
-                    INSERT INTO sensor_data
-                    SELECT * FROM temp_sensor_data
-                """)
-                
-                # 一時テーブル削除
-                self.conn.execute("DROP TABLE temp_sensor_data")
+                # Arrowテーブルを一意な名前の一時テーブルとしてDuckDBに登録
+                temp_table_name = f"temp_sensor_data_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+                try:
+                    self.conn.execute(f"CREATE TEMPORARY TABLE {temp_table_name} AS SELECT * FROM arrow_table")
+                    
+                    # メインテーブルに挿入
+                    self.conn.execute(f"""
+                        INSERT INTO sensor_data
+                        SELECT * FROM {temp_table_name}
+                    """)
+                finally:
+                    # 一時テーブル削除（エラーが発生しても削除を試みる）
+                    try:
+                        self.conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
+                    except:
+                        pass
                 
                 self.conn.commit()
                 return df.shape[0]

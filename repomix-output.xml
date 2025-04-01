@@ -45,15 +45,27 @@ The content is organized as follows:
 <directory_structure>
 .gitignore
 .python-version
+convert_to_sjis.py
+data_transformer.py
+data/test_jp_Cond.csv
+data/test1_Cond - コピー.csv
+data/test1_Cond copy 3.csv
+data/test1_Cond copy 4.csv
+data/test1_Cond copy 5.csv
+data/test1_Cond copy.csv
+data/test1_Cond.csv
 data/test1.csv
+db_manager.py
+file_processor.py
 main.py
 pyproject.toml
+utils.py
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
 
-<file path="data/test1.csv">
+<file path="data/test1_Cond - コピー.csv">
 , 2000, 2003, 1175
 , Param_A, ParamB, -,
 , kg, mm, -
@@ -79,53 +91,684 @@ wheels/
 3.11
 </file>
 
-<file path="main.py">
-import polars as pl
+<file path="convert_to_sjis.py">
+"""
+CSVファイルをUTF-8からShift-JISエンコーディングに変換するスクリプト
+"""
 
-def infer_clean_column_names(path: str) -> list[str]:
-    with open(path, encoding="utf-8") as f:
-        header_lines = [line.strip().split(",") for _, line in zip(range(3), f)]
+import os
 
-    max_len = max(len(row) for row in header_lines)
-    for row in header_lines:
-        while len(row) < max_len:
-            row.append("")
-
-    columns = []
-    for i in range(max_len):
-        name = header_lines[1][i].strip()
-        unit = header_lines[2][i].strip()
-
-        # 2行目と3行目が両方 "-" の場合はスキップ
-        if name == "-" and unit == "-":
-            continue
-
-        # パーツを整形して結合（スペース除去、空除去）
-        parts = [header_lines[j][i].strip().replace(" ", "") for j in range(3) if header_lines[j][i].strip() not in ("", "-")]
-        clean_name = "_".join(parts)
-        columns.append((i, clean_name or f"column_{i}"))
-
-    return columns
-
-def main():
-    path = "./data/test1.csv"
-    indexed_columns = infer_clean_column_names(path)
+def convert_encoding(input_file, output_file):
+    """
+    ファイルをUTF-8からShift-JISに変換する
     
-    usecols = [index for index, _ in indexed_columns]
-    colnames = [name for _, name in indexed_columns]
-
-    df = pl.read_csv(
-        path,
-        skip_rows=3,
-        has_header=False,
-        columns=usecols,
-        new_columns=colnames,
-        try_parse_dates=True
-    )
-    print(df)
+    Args:
+        input_file: 入力ファイルパス（UTF-8）
+        output_file: 出力ファイルパス（Shift-JIS）
+    """
+    # UTF-8でファイルを読み込む
+    with open(input_file, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # Shift-JISで書き込む
+    with open(output_file, 'w', encoding='shift-jis') as f:
+        f.write(content)
+    
+    print(f"ファイルを変換しました: {input_file} → {output_file}")
 
 if __name__ == "__main__":
-    main()
+    # 入出力ファイルパス
+    input_file = "data/test_jp_Cond.csv"
+    output_file = "data/test_jp_Cond_sjis.csv"
+    
+    convert_encoding(input_file, output_file)
+</file>
+
+<file path="data/test1_Cond copy 3.csv">
+, 2000, 2003, 1175
+, Param_B, ParamC, -,
+, kg, mm, -
+2025/11/20 00:00:00    ,1,"a",
+2025/11/20 00:00:01    ,0,"b",
+2025/11/20 00:00:02    ,1,"c",
+</file>
+
+<file path="data/test1_Cond copy 4.csv">
+, 2000, 2003, 1175
+, Param_A, ParamB, -,
+, kg, mm, -
+2025/11/20 00:00:00    ,1,"a",
+2025/11/20 00:00:01    ,0,"b",
+2025/11/20 00:00:02    ,1,"c",
+</file>
+
+<file path="data/test1_Cond copy 5.csv">
+, 2000, 2003, 1175
+, Param_A, ParamB, -,
+, kg, mm, -
+2025/11/20 00:00:00    ,1,"a",
+2025/11/20 00:00:01    ,0,"b",
+2025/11/20 00:00:02    ,1,"c",
+</file>
+
+<file path="data/test1_Cond copy.csv">
+, 2000, 2003, 1175
+, Param_B, ParamC, -,
+, kg, mm, -
+2025/11/20 00:00:00    ,1,"a",
+2025/11/20 00:00:01    ,0,"b",
+2025/11/20 00:00:02    ,1,"c",
+</file>
+
+<file path="file_processor.py">
+"""
+ファイル処理モジュール
+CSV/ZIPファイルの検索と処理を担当
+"""
+
+import os
+from typing import List, Dict, Any, Tuple, Set
+from pathlib import Path
+import logging
+
+from utils import (
+    find_csv_files, 
+    is_target_csv_file, 
+    extract_zip_file,
+    clean_temp_dir,
+    get_file_metadata,
+    logger
+)
+from db_manager import DatabaseManager
+
+class FileProcessor:
+    """CSVファイルとZIPファイルの処理を行うクラス"""
+    
+    def __init__(self, data_dir: str, db_manager: DatabaseManager):
+        """初期化
+
+        Args:
+            data_dir: データディレクトリのパス
+            db_manager: DatabaseManagerインスタンス
+        """
+        self.data_dir = data_dir
+        self.db_manager = db_manager
+        self.temp_dirs = []
+    
+    def get_csv_files(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """処理対象のCSVファイルを取得する
+        
+        Returns:
+            (通常のCSVファイル情報リスト, ZIP内のCSVファイル情報リスト)
+        """
+        # CSVファイルとZIPファイルを検索
+        csv_file_paths, zip_files = find_csv_files(self.data_dir)
+        
+        # 通常のCSVファイル情報リスト
+        csv_files_info = []
+        for csv_path in csv_file_paths:
+            file_info = get_file_metadata(csv_path)
+            file_info["from_zip"] = False
+            file_info["zip_path"] = None
+            csv_files_info.append(file_info)
+        
+        # ZIP内のCSVファイル情報リスト
+        zip_csv_files_info = []
+        for zip_path, zip_info in zip_files.items():
+            for csv_path in zip_info["extracted_csvs"]:
+                file_info = get_file_metadata(csv_path)
+                file_info["from_zip"] = True
+                file_info["zip_path"] = zip_path
+                file_info["temp_dir"] = zip_info["temp_dir"]
+                zip_csv_files_info.append(file_info)
+            
+            # 一時ディレクトリを記録
+            self.temp_dirs.append(zip_info["temp_dir"])
+        
+        return csv_files_info, zip_csv_files_info
+    
+    def filter_new_files(self, csv_files_info: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """未処理のCSVファイルをフィルタリングする
+        
+        Args:
+            csv_files_info: CSVファイル情報リスト
+            
+        Returns:
+            未処理のCSVファイル情報リスト
+        """
+        # 処理済みファイルのパスを取得
+        processed_files = self.db_manager.get_processed_files()
+        processed_paths = {record["file_path"] for record in processed_files}
+        
+        # 未処理のファイルのみ抽出
+        new_files = []
+        for file_info in csv_files_info:
+            if file_info["file_path"] not in processed_paths:
+                new_files.append(file_info)
+            else:
+                # 処理済みファイルの場合でも、サイズや更新日時が変わっていれば再処理
+                for processed in processed_files:
+                    if processed["file_path"] == file_info["file_path"]:
+                        if (processed["file_size"] != file_info["file_size"] or
+                            processed["modified_time"] != file_info["modified_time"]):
+                            logger.info(f"ファイル '{file_info['file_name']}' は更新されています。再処理します。")
+                            new_files.append(file_info)
+                        break
+        
+        return new_files
+    
+    def cleanup(self) -> None:
+        """一時ディレクトリなどの後処理を行う"""
+        for temp_dir in self.temp_dirs:
+            clean_temp_dir(temp_dir)
+        
+        self.temp_dirs = []
+    
+    def process_files(self) -> Tuple[int, int]:
+        """ファイルの処理を実行する
+        
+        Returns:
+            (処理されたファイル数, エラーが発生したファイル数)
+        """
+        processed_count = 0
+        error_count = 0
+        
+        try:
+            # CSVファイルを検索
+            csv_files_info, zip_csv_files_info = self.get_csv_files()
+            logger.info(f"{len(csv_files_info)}個の通常CSVファイル、{len(zip_csv_files_info)}個のZIP内CSVファイルを検出しました")
+            
+            # すべてのファイル情報を結合
+            all_files_info = csv_files_info + zip_csv_files_info
+            
+            # 未処理のファイルのみ抽出
+            new_files = self.filter_new_files(all_files_info)
+            logger.info(f"{len(new_files)}個の未処理ファイルがあります")
+            
+            # 未処理ファイルを処理
+            from data_transformer import DataTransformer
+            transformer = DataTransformer(self.db_manager)
+            
+            for file_info in new_files:
+                try:
+                    logger.info(f"ファイル '{file_info['file_name']}' を処理します")
+                    transformer.process_csv_file(file_info)
+                    processed_count += 1
+                except Exception as e:
+                    logger.error(f"ファイル '{file_info['file_name']}' の処理中にエラーが発生しました: {str(e)}")
+                    error_count += 1
+            
+            return processed_count, error_count
+            
+        finally:
+            # 一時ディレクトリを削除
+            self.cleanup()
+</file>
+
+<file path="utils.py">
+"""
+ユーティリティ関数モジュール
+CSV→DuckDB変換処理で使用する汎用関数を提供
+"""
+
+import os
+import logging
+import tempfile
+import shutil
+from pathlib import Path
+import zipfile
+from datetime import datetime
+from typing import Optional, List, Dict, Any, Tuple
+
+# ロギング設定
+def setup_logger(name: str = 'csv_to_db', level: int = logging.INFO) -> logging.Logger:
+    """ロガーの設定を行う
+
+    Args:
+        name: ロガー名
+        level: ログレベル
+
+    Returns:
+        設定済みのロガーインスタンス
+    """
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    
+    return logger
+
+# グローバルロガーインスタンス
+logger = setup_logger()
+
+def is_target_csv_file(filename: str) -> bool:
+    """処理対象のCSVファイルかどうかを判定する
+    
+    Args:
+        filename: 検証するファイル名
+        
+    Returns:
+        ファイル名に「Cond」または「User」が含まれるかつ拡張子が.csvの場合True
+    """
+    base_name = os.path.basename(filename).lower()
+    return (base_name.endswith('.csv') and 
+            ('cond' in base_name.lower() or 'user' in base_name.lower()))
+
+def extract_zip_file(zip_path: str, extract_dir: Optional[str] = None) -> str:
+    """ZIPファイルを解凍する
+    
+    Args:
+        zip_path: ZIPファイルのパス
+        extract_dir: 解凍先ディレクトリ（指定されていない場合は一時ディレクトリを作成）
+        
+    Returns:
+        解凍されたディレクトリのパス
+    """
+    if extract_dir is None:
+        extract_dir = tempfile.mkdtemp(prefix="csv_to_db_")
+    
+    logger.info(f"ZIPファイル '{zip_path}' を '{extract_dir}' に解凍します")
+    
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_dir)
+    
+    return extract_dir
+
+def clean_temp_dir(dir_path: str) -> None:
+    """一時ディレクトリを削除する
+    
+    Args:
+        dir_path: 削除する一時ディレクトリのパス
+    """
+    if os.path.exists(dir_path) and os.path.isdir(dir_path):
+        logger.info(f"一時ディレクトリ '{dir_path}' を削除します")
+        shutil.rmtree(dir_path)
+
+def get_file_metadata(file_path: str) -> Dict[str, Any]:
+    """ファイルのメタデータを取得する
+    
+    Args:
+        file_path: ファイルパス
+        
+    Returns:
+        ファイルメタデータを含む辞書
+    """
+    file_stat = os.stat(file_path)
+    file_name = os.path.basename(file_path)
+    
+    return {
+        "file_path": file_path,
+        "file_name": file_name,
+        "file_size": file_stat.st_size,
+        "modified_time": datetime.fromtimestamp(file_stat.st_mtime),
+        "load_timestamp": datetime.now()
+    }
+
+def find_csv_files(directory: str) -> Tuple[List[str], Dict[str, List[str]]]:
+    """指定ディレクトリ内のCSVファイルとZIPファイルを検索する
+    
+    Args:
+        directory: 検索対象ディレクトリ
+        
+    Returns:
+        (CSVファイルパスのリスト, {ZIPファイルパス: 抽出されたCSVファイルパスのリスト}の辞書)
+    """
+    csv_files = []
+    zip_files = {}
+    temp_dirs = []
+    
+    # ディレクトリ内のファイルをスキャン
+    for root, _, files in os.walk(directory):
+        for file in files:
+            file_path = os.path.join(root, file)
+            
+            if file.lower().endswith('.csv'):
+                if is_target_csv_file(file):
+                    csv_files.append(file_path)
+            elif file.lower().endswith('.zip'):
+                # ZIPファイルを一時ディレクトリに解凍
+                temp_dir = extract_zip_file(file_path)
+                temp_dirs.append(temp_dir)
+                
+                # 解凍したディレクトリ内のCSVファイルを検索
+                extracted_csvs = []
+                for ext_root, _, ext_files in os.walk(temp_dir):
+                    for ext_file in ext_files:
+                        ext_file_path = os.path.join(ext_root, ext_file)
+                        if ext_file.lower().endswith('.csv') and is_target_csv_file(ext_file):
+                            extracted_csvs.append(ext_file_path)
+                
+                if extracted_csvs:
+                    zip_files[file_path] = {
+                        "extracted_csvs": extracted_csvs,
+                        "temp_dir": temp_dir
+                    }
+    
+    return csv_files, zip_files
+</file>
+
+<file path="data/test_jp_Cond.csv">
+, 3000, 3001, 3002, 3001
+, 温度センサー, 湿度センサー, 気圧センサー, 湿度センサー, 気圧センサー, 湿度センサー
+, 度, ％, hPa, ％, hPa, ％
+2025/11/20 00:00:00    ,22.5,65.0,1013.2,1013.2,1013.2,1013.2
+2025/11/20 00:00:01    ,22.6,65.2,1013.1,1013.2,1013.2,1013.2
+2025/11/20 00:00:02    ,22.7,65.3,1013.0,1013.2,1013.2,1013.2
+</file>
+
+<file path="data/test1_Cond.csv">
+, 2000, 2003, 1175
+, Param_A, ParamB, -,
+, kg, mm, -
+2025/11/20 00:00:00    ,1,"a",
+2025/11/20 00:00:01    ,0,"b",
+2025/11/20 00:00:02    ,1,"c",
+</file>
+
+<file path="data/test1.csv">
+, 2000, 2003, 1175
+, Param_A, ParamB, -,
+, kg, mm, -
+2025/11/20 00:00:00    ,"a",
+2025/11/20 00:00:01    ,0,"b",
+2025/11/20 00:00:02    ,1,"c",
+</file>
+
+<file path="main.py">
+#!/usr/bin/env python3
+"""
+CSV→DuckDB変換処理メインスクリプト
+センサーデータを含むCSVファイルを読み込み、DuckDBに変換して格納する
+"""
+
+import os
+import sys
+import argparse
+from typing import Dict, Any, List
+import time
+
+from utils import logger, setup_logger
+from db_manager import DatabaseManager
+from file_processor import FileProcessor
+
+# デフォルトのデータディレクトリ
+data_dir = "./data"
+
+def parse_args():
+    """コマンドライン引数を解析する"""
+    parser = argparse.ArgumentParser(description='CSVファイルからセンサーデータをDuckDBに変換するツール')
+    parser.add_argument('-d', '--data-dir', default=data_dir,
+                        help=f'データディレクトリのパス (デフォルト: {data_dir})')
+    parser.add_argument('-o', '--output', default='sensor_data.duckdb',
+                        help='出力DuckDBファイルのパス (デフォルト: sensor_data.duckdb)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='詳細なログ出力を有効にする')
+    return parser.parse_args()
+
+def main():
+    """メイン処理"""
+    # コマンドライン引数の解析
+    args = parse_args()
+    
+    # ログレベルの設定
+    log_level = 'DEBUG' if args.verbose else 'INFO'
+    setup_logger(level=getattr(logging, log_level))
+    
+    logger.info("CSV→DuckDB変換処理を開始します")
+    
+    # データディレクトリの確認
+    if not os.path.exists(args.data_dir):
+        logger.error(f"データディレクトリ '{args.data_dir}' が存在しません")
+        return 1
+    
+    # 処理時間計測開始
+    start_time = time.time()
+    
+    try:
+        # データベース接続
+        db_manager = DatabaseManager(args.output)
+        
+        # ファイル処理
+        processor = FileProcessor(args.data_dir, db_manager)
+        processed_count, error_count = processor.process_files()
+        
+        # 処理結果の表示
+        total_records = db_manager.get_sensor_data_count()
+        
+        logger.info(f"処理が完了しました:")
+        logger.info(f"- 処理ファイル数: {processed_count}")
+        logger.info(f"- エラーファイル数: {error_count}")
+        logger.info(f"- 総レコード数: {total_records}")
+        
+        # データベース接続を閉じる
+        db_manager.close()
+        
+        # 処理時間の表示
+        elapsed_time = time.time() - start_time
+        logger.info(f"処理時間: {elapsed_time:.2f}秒")
+        
+        return 0
+        
+    except Exception as e:
+        logger.exception(f"処理中にエラーが発生しました: {str(e)}")
+        return 1
+
+if __name__ == "__main__":
+    import logging
+    sys.exit(main())
+</file>
+
+<file path="db_manager.py">
+"""
+データベース管理モジュール
+DuckDBの操作と管理を担当
+"""
+
+import duckdb
+import polars as pl
+from typing import Dict, Any, List, Union
+from datetime import datetime
+import os
+
+from utils import logger
+
+class DatabaseManager:
+    """DuckDBの管理を行うクラス"""
+    
+    def __init__(self, db_path: str = 'sensor_data.duckdb'):
+        """初期化
+        
+        Args:
+            db_path: DuckDBファイルのパス
+        """
+        self.db_path = db_path
+        self.conn = None
+        self.initialize_db()
+    
+    def initialize_db(self) -> None:
+        """データベースを初期化する"""
+        create_db = not os.path.exists(self.db_path)
+        
+        # データベースに接続
+        self.conn = duckdb.connect(self.db_path)
+        
+        # 初回接続時にテーブル作成
+        if create_db:
+            logger.info(f"データベース '{self.db_path}' を新規作成します")
+            
+            # センサーデータテーブル
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS sensor_data (
+                    file_path TEXT,
+                    file_name TEXT,
+                    zip_path TEXT,
+                    load_timestamp TIMESTAMP,
+                    timestamp TIMESTAMP,
+                    sensor_id TEXT,
+                    sensor_name TEXT,
+                    unit TEXT,
+                    value DOUBLE,
+                    PRIMARY KEY (timestamp, sensor_id, file_path)
+                )
+            """)
+            
+            # 処理済みファイルテーブル
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS processed_files (
+                    file_path TEXT PRIMARY KEY,
+                    file_name TEXT,
+                    file_size INTEGER,
+                    modified_time TIMESTAMP,
+                    load_timestamp TIMESTAMP,
+                    zip_path TEXT,
+                    status TEXT
+                )
+            """)
+            
+            self.conn.commit()
+    
+    def close(self) -> None:
+        """データベース接続を閉じる"""
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+    
+    def get_processed_files(self) -> List[Dict[str, Any]]:
+        """処理済みファイルの一覧を取得する
+        
+        Returns:
+            処理済みファイル情報のリスト
+        """
+        result = self.conn.execute("SELECT * FROM processed_files").fetchall()
+        columns = ["file_path", "file_name", "file_size", "modified_time", 
+                  "load_timestamp", "zip_path", "status"]
+        
+        records = []
+        for row in result:
+            record = {columns[i]: row[i] for i in range(len(columns))}
+            records.append(record)
+        
+        return records
+    
+    def insert_processed_file(self, file_info: Dict[str, Any]) -> None:
+        """処理済みファイル情報をデータベースに格納する
+        
+        Args:
+            file_info: ファイル情報
+        """
+        # 既存レコードがあれば削除
+        self.conn.execute("""
+            DELETE FROM processed_files
+            WHERE file_path = ?
+        """, [file_info["file_path"]])
+        
+        # 新たにレコードを挿入
+        self.conn.execute("""
+            INSERT INTO processed_files (
+                file_path, file_name, file_size, modified_time, 
+                load_timestamp, zip_path, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, [
+            file_info["file_path"],
+            file_info["file_name"],
+            file_info["file_size"],
+            file_info["modified_time"],
+            datetime.now(),
+            file_info.get("zip_path"),
+            "completed"
+        ])
+        
+        self.conn.commit()
+    
+    def insert_sensor_data(self, lazy_df: pl.LazyFrame, file_info: Dict[str, Any]) -> int:
+        """センサーデータをDuckDBに格納する（PyArrowを使用）
+        
+        Args:
+            lazy_df: 変換済みのLazyFrame
+            file_info: ファイル情報
+            
+        Returns:
+            挿入されたレコード数
+        """
+        # collect_schemaでスキーマを取得（warning回避のため）
+        schema = lazy_df.collect_schema()
+        if schema:  # スキーマが存在する場合（空でない場合）
+            # 既存の重複データを削除
+            self.conn.execute("""
+                DELETE FROM sensor_data
+                WHERE file_path = ?
+            """, [file_info["file_path"]])
+            
+            # データを収集
+            df = lazy_df.collect()
+            if df.shape[0] > 0:
+                # PyArrowを使用してデータを転送
+                # Arrow形式に変換
+                arrow_table = df.to_arrow()
+                
+                # Arrowテーブルを一意な名前の一時テーブルとしてDuckDBに登録
+                temp_table_name = f"temp_sensor_data_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+                try:
+                    self.conn.execute(f"CREATE TEMPORARY TABLE {temp_table_name} AS SELECT * FROM arrow_table")
+                    
+                    # メインテーブルに挿入
+                    self.conn.execute(f"""
+                        INSERT INTO sensor_data
+                        SELECT * FROM {temp_table_name}
+                    """)
+                finally:
+                    # 一時テーブル削除（エラーが発生しても削除を試みる）
+                    try:
+                        self.conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
+                    except:
+                        pass
+                
+                self.conn.commit()
+                return df.shape[0]
+        
+        return 0
+    
+    def get_sensor_data_count(self) -> int:
+        """センサーデータの総レコード数を取得する
+        
+        Returns:
+            レコード数
+        """
+        result = self.conn.execute("SELECT COUNT(*) FROM sensor_data").fetchone()
+        return result[0] if result else 0
+    
+    def get_sensor_summary(self) -> List[Dict[str, Any]]:
+        """センサーデータの概要を取得する
+        
+        Returns:
+            センサーごとの概要情報
+        """
+        result = self.conn.execute("""
+            SELECT 
+                sensor_id, 
+                sensor_name, 
+                unit, 
+                COUNT(*) as record_count,
+                MIN(timestamp) as first_timestamp,
+                MAX(timestamp) as last_timestamp
+            FROM sensor_data
+            GROUP BY sensor_id, sensor_name, unit
+            ORDER BY sensor_id
+        """).fetchall()
+        
+        columns = ["sensor_id", "sensor_name", "unit", "record_count", 
+                  "first_timestamp", "last_timestamp"]
+        
+        summary = []
+        for row in result:
+            record = {columns[i]: row[i] for i in range(len(columns))}
+            summary.append(record)
+        
+        return summary
 </file>
 
 <file path="pyproject.toml">
@@ -138,7 +781,347 @@ requires-python = ">=3.11"
 dependencies = [
     "duckdb>=1.2.1",
     "polars>=1.26.0",
+    "pyarrow>=19.0.1",
 ]
+</file>
+
+<file path="data_transformer.py">
+"""
+データ変換モジュール
+CSVデータの読み込みと変換処理を担当
+"""
+
+from typing import Dict, Any, List, Tuple
+from datetime import datetime
+import logging
+import os
+import tempfile
+import shutil
+import re
+
+from utils import logger
+
+class DataTransformer:
+    """CSVデータの変換を行うクラス"""
+    
+    def __init__(self, db_manager):
+        """初期化
+        
+        Args:
+            db_manager: DatabaseManagerインスタンス
+        """
+        self.db_manager = db_manager
+    
+    def _detect_encoding(self, file_path: str) -> str:
+        """CSVファイルのエンコーディングを検出する
+        
+        Args:
+            file_path: CSVファイルパス
+            
+        Returns:
+            検出されたエンコーディング（'shift-jis'または'utf-8'）
+        """
+        try:
+            # まずShift-JISとして読み込みを試みる
+            with open(file_path, 'r', encoding='shift-jis') as f:
+                f.read(100)
+            return 'shift-jis'
+        except UnicodeDecodeError:
+            # Shift-JISでエラーの場合はUTF-8を試す
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    f.read(100)
+                return 'utf-8'
+            except UnicodeDecodeError:
+                # デフォルトとしてShift-JISを返す
+                logger.warning(f"ファイル '{file_path}' のエンコーディングを検出できませんでした。Shift-JISとして処理します。")
+                return 'shift-jis'
+    
+    def _convert_to_utf8(self, file_path: str) -> Tuple[str, bool]:
+        """CSVファイルをUTF-8に変換する
+        
+        Args:
+            file_path: 元のCSVファイルパス
+            
+        Returns:
+            (変換後のファイルパス, 一時ファイルが作成されたかどうか)
+        """
+        # エンコーディングを検出
+        encoding = self._detect_encoding(file_path)
+        logger.info(f"ファイル '{file_path}' のエンコーディングを '{encoding}' として処理します。")
+        
+        # すでにUTF-8の場合はそのまま返す
+        if encoding.lower() in ['utf-8', 'utf8']:
+            return file_path, False
+        
+        # 一時ファイルを作成
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.csv')
+        temp_file_path = temp_file.name
+        temp_file.close()
+        
+        try:
+            # 元のファイルを読み込み
+            with open(file_path, 'r', encoding=encoding) as f_in:
+                content = f_in.read()
+            
+            # UTF-8で書き込み
+            with open(temp_file_path, 'w', encoding='utf-8') as f_out:
+                f_out.write(content)
+            
+            logger.info(f"ファイル '{file_path}' を一時的にUTF-8に変換しました（{encoding} → UTF-8）")
+            return temp_file_path, True
+            
+        except Exception as e:
+            # エラーが発生した場合は一時ファイルを削除
+            if os.path.exists(temp_file_path):
+                os.unlink(temp_file_path)
+            
+            logger.error(f"エンコーディング変換エラー: {str(e)}")
+            raise
+    
+    def _process_csv_manually(self, file_path: str, file_info: Dict[str, Any]) -> List[Dict]:
+        """CSVファイルを完全に手動で読み込んで処理する
+        
+        Args:
+            file_path: CSVファイルパス
+            file_info: ファイル情報
+            
+        Returns:
+            変換後のレコードリスト
+        """
+        encoding = self._detect_encoding(file_path)
+        
+        # ファイルの全行を読み込む
+        lines = []
+        with open(file_path, 'r', encoding=encoding) as f:
+            for line in f:
+                line = line.strip()
+                if line:  # 空行を除外
+                    lines.append(line)
+        
+        if len(lines) < 4:  # ヘッダー3行 + データ行が少なくとも1行必要
+            logger.warning(f"ファイル '{file_path}' には十分な行数がありません")
+            return []
+        
+        # ヘッダー行を解析
+        header_rows = [line.split(',') for line in lines[:3]]
+        
+        # 各行の列数が一致していない場合は調整
+        max_cols = max(len(row) for row in header_rows)
+        for i in range(len(header_rows)):
+            # 不足している列を空文字で埋める
+            while len(header_rows[i]) < max_cols:
+                header_rows[i].append('')
+            
+            # 各列の空白を削除
+            header_rows[i] = [col.strip() for col in header_rows[i]]
+        
+        # センサー情報を構築
+        sensor_info = {}
+        for col_idx in range(1, max_cols):  # 最初の列（日時列）をスキップ
+            sensor_id = header_rows[0][col_idx] if col_idx < len(header_rows[0]) else ''
+            if not sensor_id:
+                continue
+            
+            sensor_name = header_rows[1][col_idx] if col_idx < len(header_rows[1]) else '-'
+            unit = header_rows[2][col_idx] if col_idx < len(header_rows[2]) else '-'
+            
+            # センサー名と単位が「-」ではないカラムのみ保持
+            if not (sensor_name == '-' and unit == '-'):
+                sensor_info[col_idx] = {
+                    'sensor_id': sensor_id,
+                    'sensor_name': sensor_name,
+                    'unit': unit
+                }
+        
+        # データ行を処理
+        results = []
+        timestamp_pattern = re.compile(r'\d{4}/\d{1,2}/\d{1,2}\s+\d{1,2}:\d{1,2}:\d{1,2}')
+        
+        for line in lines[3:]:  # ヘッダー3行をスキップ
+            cols = line.split(',')
+            cols = [col.strip() for col in cols]
+            
+            # 必要に応じて列を追加
+            while len(cols) < max_cols:
+                cols.append('')
+            
+            # タイムスタンプのチェック（最初の列）
+            if not cols[0] or not timestamp_pattern.match(cols[0]):
+                continue
+            
+            # タイムスタンプを解析
+            try:
+                timestamp = datetime.strptime(cols[0], '%Y/%m/%d %H:%M:%S')
+            except ValueError:
+                logger.warning(f"無効な日時フォーマット: {cols[0]}")
+                continue
+            
+            # 各センサーのデータを処理
+            for col_idx, info in sensor_info.items():
+                if col_idx < len(cols) and cols[col_idx]:
+                    try:
+                        # 数値に変換
+                        value = float(cols[col_idx])
+                        
+                        # レコードを作成
+                        results.append({
+                            'timestamp': timestamp,
+                            'sensor_id': info['sensor_id'],
+                            'sensor_name': info['sensor_name'],
+                            'unit': info['unit'],
+                            'value': value,
+                            'file_path': file_info['file_path'],
+                            'file_name': file_info['file_name'],
+                            'load_timestamp': datetime.now(),
+                            'zip_path': file_info.get('zip_path', None)
+                        })
+                    except ValueError:
+                        # 文字列値の場合は警告せずにスキップ
+                        pass
+        
+        return results
+    
+    def _transform_csv_data(self, file_path: str, file_info: Dict[str, Any]) -> List[Dict]:
+        """CSVデータを読み込んで変換する（縦持ち形式に変換）
+        
+        Args:
+            file_path: CSVファイルパス
+            file_info: ファイル情報
+            
+        Returns:
+            変換後のレコードリスト
+        """
+        # 必要に応じてUTF-8に変換
+        utf8_file_path, temp_file_created = self._convert_to_utf8(file_path)
+        
+        try:
+            # ファイルを手動で処理
+            result_records = self._process_csv_manually(utf8_file_path, file_info)
+            
+            if not result_records:
+                logger.warning(f"ファイル '{file_info['file_name']}' に有効なセンサーデータがありませんでした")
+            
+            return result_records
+            
+        except Exception as e:
+            logger.error(f"変換エラー: {str(e)}")
+            raise
+        finally:
+            # エラーの有無にかかわらず一時ファイルを削除
+            if temp_file_created and os.path.exists(utf8_file_path):
+                os.unlink(utf8_file_path)
+    
+    def process_csv_file(self, file_info: Dict[str, Any]) -> int:
+        """CSVファイルを処理してDBに格納する
+        
+        Args:
+            file_info: ファイル情報
+            
+        Returns:
+            処理されたレコード数
+        """
+        file_path = file_info['file_path']
+        logger.info(f"ファイル '{file_info['file_name']}' を処理しています...")
+        
+        try:
+            # CSVデータを変換
+            transformed_records = self._transform_csv_data(file_path, file_info)
+            
+            # 既存の重複データを削除
+            self.db_manager.conn.execute("""
+                DELETE FROM sensor_data
+                WHERE file_path = ?
+            """, [file_info["file_path"]])
+            
+            # 変換結果をDuckDBに直接挿入（重複キーを避けるため一時テーブルを使用）
+            record_count = 0
+            if transformed_records:
+                # 一時テーブルの作成（一意の名前を使用）
+                temp_table_name = f"temp_sensor_data_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+                try:
+                    # 一時テーブルの作成
+                    self.db_manager.conn.execute(f"""
+                        CREATE TEMPORARY TABLE {temp_table_name} (
+                            timestamp TIMESTAMP,
+                            sensor_id TEXT,
+                            sensor_name TEXT,
+                            unit TEXT,
+                            value DOUBLE,
+                            file_path TEXT,
+                            file_name TEXT,
+                            load_timestamp TIMESTAMP,
+                            zip_path TEXT
+                        )
+                    """)
+                    
+                    # 一時テーブルにデータを挿入
+                    for record in transformed_records:
+                        self.db_manager.conn.execute(f"""
+                            INSERT INTO {temp_table_name} (
+                                timestamp, sensor_id, sensor_name, unit, value,
+                                file_path, file_name, load_timestamp, zip_path
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, [
+                            record['timestamp'],
+                            record['sensor_id'],
+                            record['sensor_name'],
+                            record['unit'],
+                            record['value'],
+                            record['file_path'],
+                            record['file_name'],
+                            record['load_timestamp'],
+                            record['zip_path']
+                        ])
+                    
+                    # 一時テーブルから一意のレコードのみをメインテーブルに挿入
+                    # GROUP BYを使用して重複を排除
+                    # レコード数を事前に取得
+                    record_count_result = self.db_manager.conn.execute(f"""
+                        SELECT COUNT(*) FROM (
+                            SELECT 
+                                timestamp, 
+                                sensor_id, 
+                                file_path
+                            FROM {temp_table_name}
+                            GROUP BY timestamp, sensor_id, file_path
+                        )
+                    """).fetchone()
+                    record_count = record_count_result[0] if record_count_result else 0
+                    
+                    # 一意のレコードをメインテーブルに挿入
+                    self.db_manager.conn.execute(f"""
+                        INSERT INTO sensor_data
+                        SELECT 
+                            timestamp, 
+                            sensor_id, 
+                            MAX(sensor_name) as sensor_name,
+                            MAX(unit) as unit, 
+                            MAX(value) as value,
+                            file_path, 
+                            MAX(file_name) as file_name, 
+                            MAX(load_timestamp) as load_timestamp, 
+                            MAX(zip_path) as zip_path
+                        FROM {temp_table_name}
+                        GROUP BY timestamp, sensor_id, file_path
+                    """)
+                    
+                    self.db_manager.conn.commit()
+                    
+                finally:
+                    # 一時テーブルを削除（エラーが発生しても削除を試みる）
+                    try:
+                        self.db_manager.conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
+                    except Exception as e:
+                        logger.warning(f"一時テーブル削除中にエラーが発生しました: {str(e)}")
+            
+            # 処理済みファイル情報を登録
+            self.db_manager.insert_processed_file(file_info)
+            
+            logger.info(f"ファイル '{file_info['file_name']}' の処理が完了しました。{record_count}件のレコードを登録しました。")
+            return record_count
+        except Exception as e:
+            pass
 </file>
 
 </files>

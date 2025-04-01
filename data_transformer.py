@@ -11,6 +11,8 @@ import tempfile
 import shutil
 import re
 
+import polars as pl
+
 from utils import logger
 
 class DataTransformer:
@@ -194,6 +196,143 @@ class DataTransformer:
         
         return results
     
+    def _read_sensor_metadata(self, file_path: str, encoding: str) -> Tuple[List[str], List[str], List[str]]:
+        """CSVの先頭3行を手動で読み込み、センサーID行、センサー名行、ユニット行を返す。
+        
+        Args:
+            file_path: CSVファイルパス
+            encoding: ファイルのエンコーディング
+            
+        Returns:
+            (センサーID行, センサー名行, ユニット行) のタプル
+        """
+        # 先頭3行を取得
+        lines = []
+        with open(file_path, 'r', encoding=encoding) as f:
+            for _ in range(3):
+                line = f.readline()
+                if not line:
+                    break
+                lines.append(line.rstrip('\n'))
+        
+        # 行が3行以下ならエラーまたは処理打ち切り
+        if len(lines) < 3:
+            logger.warning(f"ファイル '{file_path}' の先頭3行が取得できません。形式不正の可能性。")
+            return [], [], []
+        
+        # カンマ区切りで分割
+        meta1 = [col.strip() for col in lines[0].split(',')]
+        meta2 = [col.strip() for col in lines[1].split(',')]
+        meta3 = [col.strip() for col in lines[2].split(',')]
+        
+        return meta1, meta2, meta3
+    
+    def _transform_csv_data_polars(self, utf8_file_path: str, file_info: Dict[str, Any]) -> List[Dict]:
+        """Polarsを用いてCSVを高速に読み込み・縦持ち変換して、DuckDBに格納しやすい形式(list of dict)で返す。
+        
+        Args:
+            utf8_file_path: UTF-8エンコードされたCSVファイルパス
+            file_info: ファイル情報
+            
+        Returns:
+            変換後のレコードリスト
+        """
+        # 先にセンサーメタデータを取得
+        meta1, meta2, meta3 = self._read_sensor_metadata(utf8_file_path, encoding='utf-8')
+        
+        if len(meta1) < 2 or len(meta2) < 2 or len(meta3) < 2:
+            # 十分なメタデータがない場合は空を返す
+            return []
+        
+        # 以降の行をPolarsで読み込み
+        try:
+            # has_header=Falseで読んで、全列をstringとして受け取る
+            df = pl.read_csv(
+                utf8_file_path,
+                skip_rows=3,
+                has_header=False,
+                infer_schema_length=0  # 大きなファイルでも一気に推定しようとしない
+            )
+        except Exception as e:
+            logger.error(f"PolarsでのCSV読み込みに失敗しました: {e}")
+            return []
+        
+        if df.height == 0:
+            logger.warning(f"ファイル '{file_info['file_name']}' にデータ行がありません。")
+            return []
+        
+        # カラム数チェック
+        col_count = df.width
+        # meta1,meta2,meta3は少なくともdfのカラム数と同じ以上の要素を含む必要がある（0列目=日付列+N列）
+        if len(meta1) < col_count:
+            logger.warning(f"ヘッダー列数({len(meta1)}) < 実データ列数({col_count})。一部列が対応付けできません。")
+        # ここではエラーにはせずに、読み込めた範囲で処理する
+        
+        # カラム名を文字列に変換
+        df.columns = [f"col_{i}" for i in range(col_count)]
+        
+        # 0列目(timestamp)を日時型に変換(失敗する場合はnull)
+        # 注: str.strip()は直接使えないため、pl.lit().str_strip()またはstrptimeで直接処理
+        df = df.with_columns(
+            pl.col("col_0").str.strptime(pl.Datetime, "%Y/%m/%d %H:%M:%S", strict=False).alias("timestamp")
+        )
+        
+        # meltで1列目以降を縦持ちに変換
+        sensor_cols = [f"col_{i}" for i in range(1, col_count)]
+        melted = df.melt(
+            id_vars=["timestamp"],      # この列を主軸に
+            value_vars=sensor_cols,     # melt対象の列一覧
+            variable_name="col_index",  # melt後にどの列だったかを示す列
+            value_name="value"          # 値を示す列
+        )
+        
+        # valueをfloatに変換（変換に失敗する場合はnull）
+        melted = melted.with_columns(
+            pl.col("value").cast(pl.Float64, strict=False)
+        )
+        
+        # col_indexからindex番号を抽出（"col_3" → 3）
+        # 注: 正規表現置換の構文を最新のPolarsに合わせて修正
+        melted = melted.with_columns(
+            pl.col("col_index").str.replace_all("col_", "").cast(pl.UInt32).alias("col_num")
+        )
+        
+        # メタ情報を辞書にまとめておく { col_num: (sensor_id, sensor_name, unit) }
+        meta_map = {}
+        for col_i in range(1, len(meta1)):
+            sensor_id = meta1[col_i] if col_i < len(meta1) else ""
+            sensor_name = meta2[col_i] if col_i < len(meta2) else "-"
+            unit = meta3[col_i] if col_i < len(meta3) else "-"
+            meta_map[col_i] = (sensor_id, sensor_name, unit)
+        
+        # Polars DataFrameをPython (list of dict)に変換
+        final_records = []
+        
+        for row in melted.iter_rows(named=True):
+            ts = row["timestamp"]
+            col_num = row["col_num"]
+            val = row["value"]
+            
+            # timestampがNoneの場合や、対応するメタ情報がない場合、valueがNoneの場合はスキップ
+            if ts is None or col_num not in meta_map or val is None:
+                continue
+            
+            sensor_id, sensor_name, unit = meta_map[col_num]
+            
+            final_records.append({
+                'timestamp': ts,
+                'sensor_id': sensor_id,
+                'sensor_name': sensor_name,
+                'unit': unit,
+                'value': float(val),
+                'file_path': file_info['file_path'],
+                'file_name': file_info['file_name'],
+                'load_timestamp': datetime.now(),
+                'zip_path': file_info.get('zip_path', None)
+            })
+        
+        return final_records
+    
     def _transform_csv_data(self, file_path: str, file_info: Dict[str, Any]) -> List[Dict]:
         """CSVデータを読み込んで変換する（縦持ち形式に変換）
         
@@ -208,8 +347,13 @@ class DataTransformer:
         utf8_file_path, temp_file_created = self._convert_to_utf8(file_path)
         
         try:
-            # ファイルを手動で処理
-            result_records = self._process_csv_manually(utf8_file_path, file_info)
+            # Polarsを使用した高速処理
+            result_records = self._transform_csv_data_polars(utf8_file_path, file_info)
+            
+            # Polarsでの処理に失敗した場合やレコードが得られなかった場合は従来の手動処理を試みる
+            if not result_records:
+                logger.info(f"Polarsでの処理が失敗またはデータなし。従来の手動処理を試みます。")
+                result_records = self._process_csv_manually(utf8_file_path, file_info)
             
             if not result_records:
                 logger.warning(f"ファイル '{file_info['file_name']}' に有効なセンサーデータがありませんでした")
@@ -246,31 +390,22 @@ class DataTransformer:
                 WHERE file_path = ?
             """, [file_info["file_path"]])
             
-            # 変換結果をDuckDBに直接挿入（重複キーを避けるため一時テーブルを使用）
+            # 変換結果をDuckDBに挿入
             record_count = 0
             if transformed_records:
-                # 一時テーブルの作成（一意の名前を使用）
-                temp_table_name = f"temp_sensor_data_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
                 try:
-                    # 一時テーブルの作成
-                    self.db_manager.conn.execute(f"""
-                        CREATE TEMPORARY TABLE {temp_table_name} (
-                            timestamp TIMESTAMP,
-                            sensor_id TEXT,
-                            sensor_name TEXT,
-                            unit TEXT,
-                            value DOUBLE,
-                            file_path TEXT,
-                            file_name TEXT,
-                            load_timestamp TIMESTAMP,
-                            zip_path TEXT
-                        )
-                    """)
-                    
-                    # 一時テーブルにデータを挿入
+                    # 重複排除はクライアント側でメモリ内で行う
+                    # センサーID、タイムスタンプ、ファイルパスの組み合わせごとに最新のレコードのみを保持
+                    unique_records = {}
                     for record in transformed_records:
-                        self.db_manager.conn.execute(f"""
-                            INSERT INTO {temp_table_name} (
+                        key = (record['timestamp'], record['sensor_id'], record['file_path'])
+                        # 同じキーのレコードがすでにある場合、最新のレコードを保持
+                        unique_records[key] = record
+                    
+                    # 一意のレコードのみをメインテーブルに挿入
+                    for record in unique_records.values():
+                        self.db_manager.conn.execute("""
+                            INSERT INTO sensor_data (
                                 timestamp, sensor_id, sensor_name, unit, value,
                                 file_path, file_name, load_timestamp, zip_path
                             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -286,46 +421,13 @@ class DataTransformer:
                             record['zip_path']
                         ])
                     
-                    # 一時テーブルから一意のレコードのみをメインテーブルに挿入
-                    # GROUP BYを使用して重複を排除
-                    # レコード数を事前に取得
-                    record_count_result = self.db_manager.conn.execute(f"""
-                        SELECT COUNT(*) FROM (
-                            SELECT 
-                                timestamp, 
-                                sensor_id, 
-                                file_path
-                            FROM {temp_table_name}
-                            GROUP BY timestamp, sensor_id, file_path
-                        )
-                    """).fetchone()
-                    record_count = record_count_result[0] if record_count_result else 0
-                    
-                    # 一意のレコードをメインテーブルに挿入
-                    self.db_manager.conn.execute(f"""
-                        INSERT INTO sensor_data
-                        SELECT 
-                            timestamp, 
-                            sensor_id, 
-                            MAX(sensor_name) as sensor_name,
-                            MAX(unit) as unit, 
-                            MAX(value) as value,
-                            file_path, 
-                            MAX(file_name) as file_name, 
-                            MAX(load_timestamp) as load_timestamp, 
-                            MAX(zip_path) as zip_path
-                        FROM {temp_table_name}
-                        GROUP BY timestamp, sensor_id, file_path
-                    """)
+                    # レコード数をカウント
+                    record_count = len(unique_records)
                     
                     self.db_manager.conn.commit()
-                    
-                finally:
-                    # 一時テーブルを削除（エラーが発生しても削除を試みる）
-                    try:
-                        self.db_manager.conn.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
-                    except Exception as e:
-                        logger.warning(f"一時テーブル削除中にエラーが発生しました: {str(e)}")
+                except Exception as e:
+                    logger.error(f"データベース挿入エラー: {str(e)}")
+                    raise
             
             # 処理済みファイル情報を登録
             self.db_manager.insert_processed_file(file_info)
@@ -333,4 +435,5 @@ class DataTransformer:
             logger.info(f"ファイル '{file_info['file_name']}' の処理が完了しました。{record_count}件のレコードを登録しました。")
             return record_count
         except Exception as e:
-            pass
+            logger.error(f"ファイル '{file_info['file_name']}' の処理中にエラーが発生しました: {e}")
+            raise

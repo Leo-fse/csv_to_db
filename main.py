@@ -457,7 +457,7 @@ def process_single_file(file_info, temp_dir, db_path):
 
 def process_csv_files(csv_files, db_path, process_all=False):
     """
-    CSVファイルのリストを処理する（並列処理版）
+    CSVファイルのリストを処理する（改良版）
 
     Parameters:
     csv_files (list): 処理するCSVファイルのリスト
@@ -469,6 +469,9 @@ def process_csv_files(csv_files, db_path, process_all=False):
     """
     import concurrent.futures
     import multiprocessing
+    import queue
+    import threading
+    import time
 
     # 結果統計
     stats = {
@@ -546,38 +549,70 @@ def process_csv_files(csv_files, db_path, process_all=False):
     # 前処理用の接続を閉じる
     conn.close()
 
-    try:
-        # 並列処理の設定
-        max_workers = max(1, multiprocessing.cpu_count() - 1)  # CPU数-1（最低1）
-        print(f"並列処理を開始: {max_workers}ワーカー")
+    # 並列処理の方法を選択
+    # ファイル数が少ない場合は逐次処理、多い場合は並列処理
+    if len(files_to_process) <= 1:
+        # 逐次処理
+        print("逐次処理を開始")
+        for file_info in files_to_process:
+            result = process_single_file(file_info, temp_dir, db_path)
+            if result["success"]:
+                stats["newly_processed"] += 1
+            else:
+                stats["failed"] += 1
+    else:
+        # 並列処理（ThreadPoolExecutorを使用）
+        # ProcessPoolExecutorではなくThreadPoolExecutorを使用することで、
+        # ファイルアクセスの競合を減らす
+        max_workers = min(4, len(files_to_process))  # 最大4スレッド
+        print(f"並列処理を開始: {max_workers}スレッド")
+
+        # ファイルロックを管理するための辞書
+        file_locks = {}
+        lock_dict_lock = threading.Lock()
+
+        # ファイルロックを取得する関数
+        def get_file_lock(file_path):
+            with lock_dict_lock:
+                if file_path not in file_locks:
+                    file_locks[file_path] = threading.Lock()
+                return file_locks[file_path]
+
+        # ファイルロックを使用して処理する関数
+        def process_with_lock(file_info):
+            # ファイルロックを取得
+            file_path = str(file_info["actual_file_path"])
+            lock = get_file_lock(file_path)
+
+            # ロックを取得してファイルを処理
+            with lock:
+                return process_single_file(file_info, temp_dir, db_path)
 
         # 並列処理の実行
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=max_workers
-        ) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             # 各ファイルを並列処理
             futures = [
-                executor.submit(process_single_file, file_info, temp_dir, db_path)
+                executor.submit(process_with_lock, file_info)
                 for file_info in files_to_process
             ]
 
             # 結果を集計
             for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if result["success"]:
-                    stats["newly_processed"] += 1
-                else:
+                try:
+                    result = future.result()
+                    if result["success"]:
+                        stats["newly_processed"] += 1
+                    else:
+                        stats["failed"] += 1
+                except Exception as e:
+                    print(f"エラー: {str(e)}")
                     stats["failed"] += 1
 
-    except Exception as e:
-        print(f"エラー: {str(e)}")
-        stats["failed"] += (
-            len(files_to_process) - stats["newly_processed"] - stats["failed"]
-        )
-
-    finally:
-        # 一時ディレクトリを削除
+    # 一時ディレクトリを削除
+    try:
         shutil.rmtree(temp_dir)
+    except Exception as e:
+        print(f"一時ディレクトリの削除中にエラー: {str(e)}")
 
     return stats
 

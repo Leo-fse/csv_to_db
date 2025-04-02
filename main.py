@@ -169,12 +169,30 @@ def setup_database(db_path):
 
 
 def get_file_hash(file_path):
-    """ファイルのSHA256ハッシュを計算する"""
+    """ファイルのSHA256ハッシュを計算する（最適化版）"""
+    import mmap
+
     sha256_hash = hashlib.sha256()
+
+    # ファイルサイズを取得
+    file_size = os.path.getsize(file_path)
+
     with open(file_path, "rb") as f:
-        # ファイルを小さなチャンクで読み込んでハッシュ計算
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256_hash.update(byte_block)
+        # 小さなファイルは通常の方法で処理
+        if file_size < 1024 * 1024:  # 1MB未満
+            sha256_hash.update(f.read())
+        else:
+            # 大きなファイルはメモリマッピングを使用
+            try:
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    # メモリマップされたファイルを直接ハッシュ計算に使用
+                    sha256_hash.update(mm)
+            except (ValueError, OSError):
+                # mmapが使用できない場合は通常の方法にフォールバック
+                f.seek(0)
+                for byte_block in iter(lambda: f.read(4096), b""):
+                    sha256_hash.update(byte_block)
+
     return sha256_hash.hexdigest()
 
 
@@ -227,32 +245,62 @@ def process_csv_file(file_path):
     file_path (Path): 処理するCSVファイルのパス
 
     Returns:
-    bool: 処理が成功したかどうか
+    pl.DataFrame: 処理されたデータフレーム
     """
     print(f"処理中: {file_path}")
 
-    # 1~3行目はヘッダー(1行目はセンサーID、2行目はセンサー名、３行目は単位)として読み込む
-    # 4行目以降はデータとして読み込む
-    encoding = os.environ.get("encoding", "utf-8")
-    header_df = pl.read_csv(
-        file_path,
-        n_rows=3,
-        has_header=False,
-        truncate_ragged_lines=True,
-        encoding=encoding,
-    )
+    # ファイル全体を一度に読み込む
+    encoding = os.environ.get("encoding", "shift-jis")
 
-    # 1列多く読み込まれる（最終列は不要）
-    # スキーマ推論の範囲を増やす。
+    # Shift-JISエンコーディングの場合、一度ファイルを読み込んでUTF-8に変換
+    if encoding.lower() in ["shift-jis", "shift_jis", "sjis", "cp932", "ms932"]:
+        # 一時ファイルを作成
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_file:
+            temp_path = temp_file.name
 
-    data_df = pl.read_csv(
-        file_path,
-        skip_rows=3,
-        has_header=False,
-        truncate_ragged_lines=True,
-        infer_schema_length=10000,  # スキーマ推論の範囲を増やす
-        encoding=encoding,
-    )[:, :-1]
+        # Shift-JISファイルを読み込んでUTF-8に変換して一時ファイルに書き込む
+        with open(file_path, "r", encoding=encoding) as src_file:
+            with open(temp_path, "w", encoding="utf-8") as dest_file:
+                dest_file.write(src_file.read())
+
+        # 一時ファイルを処理対象に変更
+        file_path = temp_path
+        # 以降の処理ではUTF-8として扱う
+        encoding = "utf-8"
+
+    # Polarsのscan_csvは'utf8'または'utf8-lossy'のみをサポート
+    polars_encoding = "utf8" if encoding.lower() in ["utf-8", "utf8"] else "utf8-lossy"
+
+    # LazyFrameとDataFrameの変数
+    lazy_df = None
+    header_df = None
+    data_df = None
+
+    try:
+        lazy_df = pl.scan_csv(
+            file_path,
+            has_header=False,
+            truncate_ragged_lines=True,
+            encoding=polars_encoding,
+            infer_schema_length=10000,  # スキーマ推論の範囲を増やす
+        )
+
+        # ヘッダー部分（最初の3行）を取得
+        header_df = lazy_df.slice(0, 3).collect()
+
+        # データ部分（4行目以降）を取得し、最後の列（空白列）を除外
+        data_df = lazy_df.slice(3, None).collect()[:, :-1]
+    finally:
+        # 一時ファイルを削除（Shift-JISからの変換時のみ）
+        if (
+            encoding == "utf-8"
+            and str(file_path).endswith(".csv")
+            and str(file_path) != str(Path(file_path).name)
+        ):
+            try:
+                os.unlink(file_path)
+            except:
+                pass
 
     # 列名を設定する（変換前）
     column_names = ["Time"] + [f"col_{i}" for i in range(1, data_df.width)]
@@ -272,41 +320,18 @@ def process_csv_file(file_path):
     sensor_names = list(header_df.row(1)[1:])
     sensor_units = list(header_df.row(2)[1:])
 
-    # 列番号からセンサー情報へのマッピング辞書を作成
-    sensor_info = {}
-    for i, (sensor_id, sensor_name, sensor_unit) in enumerate(
-        zip(sensor_ids, sensor_names, sensor_units)
-    ):
-        col_name = f"col_{i + 1}"
-        sensor_info[col_name] = {
-            "sensor_id": sensor_id,
-            "sensor_name": sensor_name,
-            "unit": sensor_unit,
+    # センサー情報のDataFrameを作成（ベクトル化処理のため）
+    sensor_df = pl.DataFrame(
+        {
+            "sensor_column": [f"col_{i + 1}" for i in range(len(sensor_ids))],
+            "sensor_id": sensor_ids,
+            "sensor_name": sensor_names,
+            "unit": sensor_units,
         }
-
-    # センサー情報を追加する関数
-    def add_sensor_info(row):
-        col_name = row["sensor_column"]
-        info = sensor_info.get(
-            col_name, {"sensor_id": "", "sensor_name": "", "unit": ""}
-        )
-        return {
-            "sensor_id": info["sensor_id"],
-            "sensor_name": info["sensor_name"],
-            "unit": info["unit"],
-        }
-
-    # センサー情報を追加
-    data_df = data_df.with_columns(
-        [
-            pl.struct(["sensor_column"])
-            .map_elements(add_sensor_info, return_dtype=pl.Struct)
-            .alias("sensor_info")
-        ]
     )
 
-    # 構造体を展開
-    data_df = data_df.unnest("sensor_info")
+    # 結合操作でセンサー情報を追加（ベクトル化された処理）
+    data_df = data_df.join(sensor_df, on="sensor_column", how="left")
 
     # Filter out rows where both sensor_id and sensor_name are "-"
     data_df = data_df.filter(
@@ -331,9 +356,88 @@ def process_csv_file(file_path):
     return data_df
 
 
+def process_single_file(file_info, temp_dir, db_path):
+    """
+    単一のCSVファイルを処理する関数（並列処理用）
+
+    Parameters:
+    file_info (dict): 処理するファイルの情報
+    temp_dir (Path): 一時ディレクトリのパス
+    db_path (str or Path): DuckDBデータベースのパス
+
+    Returns:
+    dict: 処理結果
+    """
+    result = {
+        "success": False,
+        "file_path": file_info["file_path"],
+        "source_zip": file_info["source_zip"],
+        "file_hash": file_info["file_hash"],
+    }
+
+    try:
+        # ファイルを処理
+        data_df = process_csv_file(file_info["actual_file_path"])
+        if data_df is not None:
+            # ソースファイル情報を列として追加
+            data_df = data_df.with_columns(
+                [
+                    pl.lit(str(file_info["file_path"])).alias("source_file"),
+                    pl.lit(
+                        str(file_info["source_zip"]) if file_info["source_zip"] else ""
+                    ).alias("source_zip"),
+                ]
+            )
+
+            # データベース接続（各ワーカーで個別に接続）
+            conn = setup_database(db_path)
+
+            try:
+                # DuckDBへ保存（Arrow形式を使用して高速化）
+                # DataFrameをArrowテーブルに変換
+                arrow_table = data_df.to_arrow()
+
+                # 一時テーブルとして登録
+                conn.register("temp_sensor_data", arrow_table)
+
+                # SQLで一括挿入（Arrow形式からの直接挿入）
+                conn.execute("""
+                    INSERT INTO sensor_data 
+                    SELECT * FROM temp_sensor_data
+                """)
+
+                # 一時テーブルを削除
+                conn.execute("DROP VIEW IF EXISTS temp_sensor_data")
+
+                # 処理済みに記録
+                mark_file_as_processed(
+                    conn,
+                    file_info["file_path"],
+                    file_info["file_hash"],
+                    file_info["source_zip_str"],
+                )
+
+                # コミット
+                conn.commit()
+                result["success"] = True
+            finally:
+                # 接続を閉じる
+                conn.close()
+        else:
+            print(f"エラー: {file_info['file_path']} の処理結果がNoneです")
+    except Exception as e:
+        print(
+            f"エラー処理中 {file_info['file_path']}"
+            + (f" (in {file_info['source_zip']})" if file_info["source_zip"] else "")
+            + f": {str(e)}"
+        )
+
+    return result
+
+
 def process_csv_files(csv_files, db_path, process_all=False):
     """
-    CSVファイルのリストを処理する
+    CSVファイルのリストを処理する（並列処理版）
 
     Parameters:
     csv_files (list): 処理するCSVファイルのリスト
@@ -343,6 +447,9 @@ def process_csv_files(csv_files, db_path, process_all=False):
     Returns:
     dict: 処理結果の統計情報
     """
+    import concurrent.futures
+    import multiprocessing
+
     # 結果統計
     stats = {
         "total_found": len(csv_files),
@@ -352,7 +459,7 @@ def process_csv_files(csv_files, db_path, process_all=False):
         "failed": 0,
     }
 
-    # データベース接続
+    # データベース接続（前処理用）
     conn = setup_database(db_path)
 
     # 一時ディレクトリを作成
@@ -416,81 +523,31 @@ def process_csv_files(csv_files, db_path, process_all=False):
             )
             stats["failed"] += 1
 
-    # バッチ処理の設定
-    batch_size = 10  # 一度に処理するファイル数
+    # 前処理用の接続を閉じる
+    conn.close()
 
     try:
-        # バッチ処理
-        for i in range(0, len(files_to_process), batch_size):
-            batch = files_to_process[i : i + batch_size]
+        # 並列処理の設定
+        max_workers = max(1, multiprocessing.cpu_count() - 1)  # CPU数-1（最低1）
+        print(f"並列処理を開始: {max_workers}ワーカー")
 
-            # 各ファイルを処理
-            for file_info in batch:
-                try:
-                    # ファイルを処理
-                    data_df = process_csv_file(file_info["actual_file_path"])
-                    if data_df is not None:
-                        # ソースファイル情報を列として追加
-                        data_df = data_df.with_columns(
-                            [
-                                pl.lit(str(file_info["file_path"])).alias(
-                                    "source_file"
-                                ),
-                                pl.lit(
-                                    str(file_info["source_zip"])
-                                    if file_info["source_zip"]
-                                    else ""
-                                ).alias("source_zip"),
-                            ]
-                        )
+        # 並列処理の実行
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+            # 各ファイルを並列処理
+            futures = [
+                executor.submit(process_single_file, file_info, temp_dir, db_path)
+                for file_info in files_to_process
+            ]
 
-                        # DuckDBへ保存（メモリ内処理でディスク使用量を削減）
-                        # データフレームをレコードのリストに変換
-                        records = data_df.rows()
-
-                        # カラム名を取得
-                        columns = data_df.columns
-
-                        # プレースホルダを作成
-                        placeholders = ", ".join(["?" for _ in columns])
-                        columns_str = ", ".join(columns)
-
-                        # バッチ挿入の準備
-                        batch_size = 1000  # 一度に挿入する行数
-
-                        # バッチ単位でデータを挿入
-                        for i in range(0, len(records), batch_size):
-                            batch_records = records[i : i + batch_size]
-                            # バッチ挿入クエリを実行
-                            conn.executemany(
-                                f"INSERT INTO sensor_data ({columns_str}) VALUES ({placeholders})",
-                                batch_records,
-                            )
-
-                        # 処理済みに記録
-                        mark_file_as_processed(
-                            conn,
-                            file_info["file_path"],
-                            file_info["file_hash"],
-                            file_info["source_zip_str"],
-                        )
-                        stats["newly_processed"] += 1
-                    else:
-                        stats["failed"] += 1
-                except Exception as e:
-                    print(
-                        f"エラー処理中 {file_info['file_path']}"
-                        + (
-                            f" (in {file_info['source_zip']})"
-                            if file_info["source_zip"]
-                            else ""
-                        )
-                        + f": {str(e)}"
-                    )
+            # 結果を集計
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if result["success"]:
+                    stats["newly_processed"] += 1
+                else:
                     stats["failed"] += 1
-
-            # バッチごとにコミット
-            conn.commit()
 
     except Exception as e:
         print(f"エラー: {str(e)}")
@@ -501,9 +558,6 @@ def process_csv_files(csv_files, db_path, process_all=False):
     finally:
         # 一時ディレクトリを削除
         shutil.rmtree(temp_dir)
-
-        # データベース接続を閉じる
-        conn.close()
 
     return stats
 

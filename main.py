@@ -544,22 +544,35 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="CSVファイル処理ツール")
+    # .envから読み込んだ値をraw文字列として扱う
+    folder_value = os.environ.get("folder", "data")
+    if folder_value.startswith('"') and folder_value.endswith('"'):
+        folder_value = folder_value[1:-1]
+
+    pattern_value = os.environ.get("pattern", r"(Cond|User|test)")
+    if pattern_value.startswith('"') and pattern_value.endswith('"'):
+        pattern_value = pattern_value[1:-1]
+
+    db_value = os.environ.get("db", "processed_files.duckdb")
+    if db_value.startswith('"') and db_value.endswith('"'):
+        db_value = db_value[1:-1]
+
     parser.add_argument(
         "--folder",
         type=str,
-        default=os.environ.get("folder", "data"),
+        default=folder_value,
         help="検索対象のフォルダパス",
     )
     parser.add_argument(
         "--pattern",
         type=str,
-        default=os.environ.get("pattern", r"(Cond|User|test)"),
+        default=pattern_value,
         help="ファイル名フィルタリングのための正規表現パターン",
     )
     parser.add_argument(
         "--db",
         type=str,
-        default=os.environ.get("db", "processed_files.duckdb"),
+        default=db_value,
         help="処理記録用データベースファイルのパス",
     )
     parser.add_argument(

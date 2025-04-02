@@ -7,7 +7,7 @@ import duckdb
 import hashlib
 import datetime
 import shutil
-
+import polars as pl
 # ====== ファイル抽出部分 ======
 
 def find_csv_files(folder_path, pattern):
@@ -137,6 +137,19 @@ def setup_database(db_path):
             ON processed_files(file_hash)
         """)
     
+    # センサーデータ格納テーブル
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sensor_data (
+            Time TIMESTAMP,
+            value VARCHAR,
+            sensor_id VARCHAR,
+            sensor_name VARCHAR,
+            unit VARCHAR,
+            source_file VARCHAR,
+            source_zip VARCHAR
+        )
+    """)
+    
     return conn
 
 def get_file_hash(file_path):
@@ -195,14 +208,84 @@ def process_csv_file(file_path):
     """
     print(f"処理中: {file_path}")
     
-    # ここに実際のCSV処理ロジックを実装する
-    # 例: pandas でCSVを読み込んで何らかの処理を行う
-    # import pandas as pd
-    # df = pd.read_csv(file_path)
-    # ... 処理 ...
-    
-    # 処理が成功したことを示す（実際の実装に応じて変更）
-    return True
+    # 1~3行目はヘッダー(1行目はセンサーID、2行目はセンサー名、３行目は単位)として読み込む
+    # 4行目以降はデータとして読み込む
+    header_df = pl.read_csv(file_path, n_rows=3, has_header=False, truncate_ragged_lines=True)
+
+    # 1列多く読み込まれる（最終列は不要）
+    # スキーマ推論の範囲を増やす。
+
+    data_df = pl.read_csv(
+        file_path, 
+        skip_rows=3, 
+        has_header=False, 
+        truncate_ragged_lines=True,
+        infer_schema_length=10000,  # スキーマ推論の範囲を増やす
+    )[:, :-1]
+
+    # 列名を設定する（変換前）
+    column_names = ["Time"] + [f"col_{i}" for i in range(1, data_df.width)]
+    data_df.columns = column_names
+
+    # 縦持ちデータにしたい
+    # １列目を日時として、残りの列を値として読み込む
+    data_df = data_df.unpivot(
+        index=["Time"],
+        on=[f"col_{i}" for i in range(1, data_df.width)],
+        variable_name="sensor_column",
+        value_name="value"
+    )
+
+    # センサー情報のマッピングを作成
+    sensor_ids = list(header_df.row(0)[1:])
+    sensor_names = list(header_df.row(1)[1:])
+    sensor_units = list(header_df.row(2)[1:])
+
+    # 列番号からセンサー情報へのマッピング辞書を作成
+    sensor_info = {}
+    for i, (sensor_id, sensor_name, sensor_unit) in enumerate(zip(sensor_ids, sensor_names, sensor_units)):
+        col_name = f"col_{i+1}"
+        sensor_info[col_name] = {
+            "sensor_id": sensor_id,
+            "sensor_name": sensor_name,
+            "unit": sensor_unit
+        }
+
+    # センサー情報を追加する関数
+    def add_sensor_info(row):
+        col_name = row["sensor_column"]
+        info = sensor_info.get(col_name, {"sensor_id": "", "sensor_name": "", "unit": ""})
+        return {
+            "sensor_id": info["sensor_id"],
+            "sensor_name": info["sensor_name"],
+            "unit": info["unit"]
+        }
+
+    # センサー情報を追加
+    data_df = data_df.with_columns([
+        pl.struct(["sensor_column"]).map_elements(add_sensor_info, return_dtype=pl.Struct).alias("sensor_info")
+    ])
+
+    # 構造体を展開
+    data_df = data_df.unnest("sensor_info")
+
+    # Filter out rows where both sensor_id and sensor_name are "-"
+    data_df = data_df.filter(~((pl.col("sensor_name").str.strip_chars() == "-") & (pl.col("unit").str.strip_chars() == "-")))
+
+    # Time列の末尾の空白を除去し、datetime型に変換する
+    data_df = data_df.with_columns(
+        pl.col("Time").str.strip_chars().str.strptime(pl.Datetime, format="%Y/%m/%d %H:%M:%S")
+    )
+
+    # Remove the sensor_column from the results
+    data_df = data_df.drop("sensor_column")
+    # Remove duplicate rows based on all columns
+    data_df = data_df.unique()
+    # 結果を表示
+    print(data_df.head(2))
+
+
+    return data_df
 
 def process_csv_files(csv_files, db_path, process_all=False):
     """
@@ -231,52 +314,106 @@ def process_csv_files(csv_files, db_path, process_all=False):
     # 一時ディレクトリを作成
     temp_dir = Path(tempfile.mkdtemp())
     
-    try:
-        for file_info in csv_files:
-            file_path = file_info['path']
-            source_zip = file_info['source_zip']
-            source_zip_str = str(source_zip) if source_zip else None
+    # 処理対象ファイルのリストを作成
+    files_to_process = []
+    
+    # 前処理：処理済みファイルのフィルタリング
+    for file_info in csv_files:
+        file_path = file_info['path']
+        source_zip = file_info['source_zip']
+        source_zip_str = str(source_zip) if source_zip else None
+        
+        # パスベースで既に処理済みかチェック
+        if not process_all and is_file_processed_by_path(conn, file_path, source_zip_str):
+            stats["already_processed_by_path"] += 1
+            print(f"スキップ (既処理 - パス一致): {file_path}" + (f" (in {source_zip})" if source_zip else ""))
+            continue
+        
+        # ZIPファイル内のファイルなら抽出
+        try:
+            if source_zip:
+                # 一時ファイルにZIPから抽出
+                actual_file_path = extract_from_zip(source_zip, file_path, temp_dir)
+            else:
+                actual_file_path = file_path
             
-            # パスベースで既に処理済みかチェック
-            if not process_all and is_file_processed_by_path(conn, file_path, source_zip_str):
-                stats["already_processed_by_path"] += 1
-                print(f"スキップ (既処理 - パス一致): {file_path}" + (f" (in {source_zip})" if source_zip else ""))
+            # ファイルハッシュを計算
+            file_hash = get_file_hash(actual_file_path)
+            
+            # ハッシュベースで既に処理済みかチェック
+            if not process_all and is_file_processed_by_hash(conn, file_hash):
+                stats["already_processed_by_hash"] += 1
+                print(f"スキップ (既処理 - 内容一致): {file_path}" + (f" (in {source_zip})" if source_zip else ""))
                 continue
             
-            try:
-                # ZIPファイル内のファイルなら抽出
-                if source_zip:
-                    # 一時ファイルにZIPから抽出
-                    actual_file_path = extract_from_zip(source_zip, file_path, temp_dir)
-                else:
-                    actual_file_path = file_path
-                
-                # ファイルハッシュを計算
-                file_hash = get_file_hash(actual_file_path)
-                
-                # ハッシュベースで既に処理済みかチェック
-                if not process_all and is_file_processed_by_hash(conn, file_hash):
-                    stats["already_processed_by_hash"] += 1
-                    print(f"スキップ (既処理 - 内容一致): {file_path}" + (f" (in {source_zip})" if source_zip else ""))
-                    continue
-                
-                # ファイルを処理
-                if process_csv_file(actual_file_path):
-                    # 処理済みとマーク
-                    mark_file_as_processed(conn, file_path, file_hash, source_zip_str)
-                    stats["newly_processed"] += 1
-                else:
+            # 処理対象リストに追加
+            files_to_process.append({
+                'file_path': file_path,
+                'actual_file_path': actual_file_path,
+                'source_zip': source_zip,
+                'source_zip_str': source_zip_str,
+                'file_hash': file_hash
+            })
+        except Exception as e:
+            print(f"エラー前処理中 {file_path}" + (f" (in {source_zip})" if source_zip else "") + f": {str(e)}")
+            stats["failed"] += 1
+    
+    # バッチ処理の設定
+    batch_size = 10  # 一度に処理するファイル数
+    
+    try:
+        # バッチ処理
+        for i in range(0, len(files_to_process), batch_size):
+            batch = files_to_process[i:i+batch_size]
+            
+            # 各ファイルを処理
+            for file_info in batch:
+                try:
+                    # ファイルを処理
+                    data_df = process_csv_file(file_info['actual_file_path'])
+                    if data_df is not None:
+                        # ソースファイル情報を列として追加
+                        data_df = data_df.with_columns([
+                            pl.lit(str(file_info['file_path'])).alias("source_file"),
+                            pl.lit(str(file_info['source_zip']) if file_info['source_zip'] else "").alias("source_zip")
+                        ])
+                        
+                        # DuckDBへ保存（一時CSVファイル経由でバルクインサート）
+                        # 一時CSVファイルを作成
+                        temp_csv_path = temp_dir / f"temp_data_{abs(hash(str(file_info['file_path'])))}.csv"
+                        
+                        # データフレームをCSVに保存
+                        data_df.write_csv(temp_csv_path)
+                        
+                        # CSVからDuckDBに直接ロード
+                        conn.execute(f"""
+                            INSERT INTO sensor_data 
+                            SELECT * FROM read_csv_auto('{temp_csv_path}')
+                        """)
+                        
+                        # 処理済みに記録
+                        mark_file_as_processed(conn, file_info['file_path'], file_info['file_hash'], file_info['source_zip_str'])
+                        stats["newly_processed"] += 1
+                    else:
+                        stats["failed"] += 1
+                except Exception as e:
+                    print(f"エラー処理中 {file_info['file_path']}" + 
+                          (f" (in {file_info['source_zip']})" if file_info['source_zip'] else "") + 
+                          f": {str(e)}")
                     stats["failed"] += 1
-            except Exception as e:
-                print(f"エラー処理中 {file_path}" + (f" (in {source_zip})" if source_zip else "") + f": {str(e)}")
-                stats["failed"] += 1
+            
+            # バッチごとにコミット
+            conn.commit()
+    
+    except Exception as e:
+        print(f"エラー: {str(e)}")
+        stats["failed"] += len(files_to_process) - stats["newly_processed"] - stats["failed"]
     
     finally:
         # 一時ディレクトリを削除
         shutil.rmtree(temp_dir)
         
-        # データベース接続をコミットして閉じる
-        conn.commit()
+        # データベース接続を閉じる
         conn.close()
     
     return stats
@@ -316,7 +453,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description="CSVファイル処理ツール")
     parser.add_argument("--folder", type=str, default="data", help="検索対象のフォルダパス")
-    parser.add_argument("--pattern", type=str, default=r"(Cond|User)", help="ファイル名フィルタリングのための正規表現パターン")
+    parser.add_argument("--pattern", type=str, default=r"(Cond|User|test)", help="ファイル名フィルタリングのための正規表現パターン")
     parser.add_argument("--db", type=str, default="processed_files.duckdb", help="処理記録用データベースファイルのパス")
     parser.add_argument("--process-all", action="store_true", help="処理済みファイルも再処理する場合に指定")
     

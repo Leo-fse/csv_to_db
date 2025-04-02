@@ -327,8 +327,6 @@ def process_csv_file(file_path):
     data_df = data_df.drop("sensor_column")
     # Remove duplicate rows based on all columns
     data_df = data_df.unique()
-    # 結果を表示
-    print(data_df.head(2))
 
     return data_df
 

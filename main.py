@@ -258,10 +258,30 @@ def process_csv_file(file_path):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as temp_file:
             temp_path = temp_file.name
 
-        # Shift-JISファイルを読み込んでUTF-8に変換して一時ファイルに書き込む
-        with open(file_path, "r", encoding=encoding) as src_file:
-            with open(temp_path, "w", encoding="utf-8") as dest_file:
-                dest_file.write(src_file.read())
+        try:
+            # テキストモードでの読み込みを試みる
+            with open(file_path, "r", encoding=encoding) as src_file:
+                content = src_file.read()
+                with open(temp_path, "w", encoding="utf-8") as dest_file:
+                    dest_file.write(content)
+        except UnicodeDecodeError:
+            # エンコーディングエラーが発生した場合、バイナリモードで読み込み
+            import codecs
+
+            with open(file_path, "rb") as src_file:
+                content = src_file.read()
+                # バイナリデータをShift-JISとしてデコードし、UTF-8にエンコード
+                try:
+                    decoded = content.decode(encoding, errors="replace")
+                    with open(temp_path, "w", encoding="utf-8") as dest_file:
+                        dest_file.write(decoded)
+                except Exception as e:
+                    print(f"エンコーディング変換エラー: {str(e)}")
+                    # 最終手段：バイナリデータをそのまま書き込み、Polarsのutf8-lossyで処理
+                    with open(temp_path, "wb") as dest_file:
+                        dest_file.write(content)
+                    # 以降の処理ではutf8-lossyを使用
+                    encoding = "utf8-lossy"
 
         # 一時ファイルを処理対象に変更
         file_path = temp_path

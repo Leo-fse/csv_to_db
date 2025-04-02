@@ -127,46 +127,94 @@ def setup_database(db_path):
     """DuckDBデータベースを初期化する"""
     conn = duckdb.connect(str(db_path))
 
-    # processed_filesテーブルを作成し、file_hashに一意性制約を追加
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS processed_files (
-            file_path VARCHAR NOT NULL,
-            file_hash VARCHAR NOT NULL,
-            source_zip VARCHAR,
-            processed_date TIMESTAMP,
-            PRIMARY KEY (file_path, source_zip)
-        )
-    """)
-
-    # file_hashに一意性インデックスが存在するか確認
+    # 既存のデータベースかどうかを確認
     result = conn.execute("""
         SELECT COUNT(*) 
-        FROM duckdb_indexes() 
-        WHERE table_name = 'processed_files' AND index_name = 'idx_processed_files_hash'
+        FROM information_schema.tables 
+        WHERE table_name = 'processed_files'
     """).fetchone()
 
-    # インデックスが存在しない場合は作成
-    if result[0] == 0:
+    # 既存のデータベースの場合
+    if result[0] > 0:
+        # processed_filesテーブルの構造を確認
+        result = conn.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'processed_files'
+        """).fetchall()
+
+        column_names = [row[0] for row in result]
+
+        # 古い形式のprocessed_filesテーブルの場合（file_hashカラムがない）
+        if "file_hash" not in column_names:
+            # 既存のテーブルを使用
+            print("既存のprocessed_filesテーブルを使用します（古い形式）")
+        else:
+            # 新しい形式のテーブルを使用
+            print("既存のprocessed_filesテーブルを使用します（新しい形式）")
+    else:
+        # 新しいデータベースの場合、processed_filesテーブルを作成
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS processed_files (
+                file_path VARCHAR NOT NULL,
+                file_hash VARCHAR NOT NULL,
+                source_zip VARCHAR,
+                processed_date TIMESTAMP,
+                PRIMARY KEY (file_path, source_zip)
+            )
+        """)
+
+        # file_hashに一意性インデックスを作成
         conn.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_files_hash 
             ON processed_files(file_hash)
         """)
 
-    # センサーデータ格納テーブル
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sensor_data (
-            Time TIMESTAMP,
-            value VARCHAR,
-            sensor_id VARCHAR,
-            sensor_name VARCHAR,
-            unit VARCHAR,
-            source_file VARCHAR,
-            source_zip VARCHAR,
-            factory VARCHAR,
-            machine_id VARCHAR,
-            data_label VARCHAR
-        )
-    """)
+    # sensor_dataテーブルの存在を確認
+    result = conn.execute("""
+        SELECT COUNT(*) 
+        FROM information_schema.tables 
+        WHERE table_name = 'sensor_data'
+    """).fetchone()
+
+    # sensor_dataテーブルが存在する場合
+    if result[0] > 0:
+        # テーブルの構造を確認
+        result = conn.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = 'sensor_data'
+        """).fetchall()
+
+        column_names = [row[0] for row in result]
+
+        # 古い形式のsensor_dataテーブルの場合（factoryカラムがなく、plant_nameカラムがある）
+        if "factory" not in column_names and "plant_name" in column_names:
+            print("既存のsensor_dataテーブルを使用します（古い形式）")
+        else:
+            print("既存のsensor_dataテーブルを使用します（新しい形式）")
+    else:
+        # 新しいデータベースの場合、sensor_dataテーブルを作成
+        # 新しい形式のテーブルを作成
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sensor_data (
+                id INTEGER PRIMARY KEY,
+                plant_name VARCHAR,
+                machine_no VARCHAR,
+                time TIMESTAMP,
+                sensor_id VARCHAR,
+                sensor_name VARCHAR,
+                sensor_unit VARCHAR,
+                value VARCHAR
+            )
+        """)
+
+        # IDの自動採番シーケンスを作成
+        conn.execute("""
+            CREATE SEQUENCE IF NOT EXISTS sensor_id_seq
+            START WITH 1
+            INCREMENT BY 1
+        """)
 
     return conn
 
@@ -407,35 +455,95 @@ def process_single_file(file_info, temp_dir, db_path, meta_info=None):
         # ファイルを処理
         data_df = process_csv_file(file_info["actual_file_path"])
         if data_df is not None:
-            # ソースファイル情報とメタ情報を列として追加
-            data_df = data_df.with_columns(
-                [
-                    pl.lit(str(file_info["file_path"])).alias("source_file"),
-                    pl.lit(
-                        str(file_info["source_zip"]) if file_info["source_zip"] else ""
-                    ).alias("source_zip"),
-                    pl.lit(meta_info.get("factory", "")).alias("factory"),
-                    pl.lit(meta_info.get("machine_id", "")).alias("machine_id"),
-                    pl.lit(meta_info.get("data_label", "")).alias("data_label"),
-                ]
-            )
-
             # データベース接続（各ワーカーで個別に接続）
             conn = setup_database(db_path)
 
             try:
-                # DuckDBへ保存（Arrow形式を使用して高速化）
-                # DataFrameをArrowテーブルに変換
-                arrow_table = data_df.to_arrow()
+                # テーブルの構造を確認
+                result = conn.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'sensor_data'
+                """).fetchall()
 
-                # 一時テーブルとして登録
-                conn.register("temp_sensor_data", arrow_table)
+                column_names = [row[0] for row in result]
 
-                # SQLで一括挿入（Arrow形式からの直接挿入）
-                conn.execute("""
-                    INSERT INTO sensor_data 
-                    SELECT * FROM temp_sensor_data
-                """)
+                # 古い形式のsensor_dataテーブルの場合（factoryカラムがなく、plant_nameカラムがある）
+                if "factory" not in column_names and "plant_name" in column_names:
+                    # 古い形式のテーブルに合わせてデータを変換
+                    print("古い形式のsensor_dataテーブルにデータを挿入します")
+
+                    # 列名を変換
+                    data_df = data_df.rename(
+                        {
+                            "Time": "time",
+                            "unit": "sensor_unit",
+                        }
+                    )
+
+                    # 工場名と機械IDを変換
+                    data_df = data_df.with_columns(
+                        [
+                            pl.lit(meta_info.get("factory", "")).alias("plant_name"),
+                            pl.lit(meta_info.get("machine_id", "")).alias("machine_no"),
+                        ]
+                    )
+
+                    # 必要な列のみを選択
+                    data_df = data_df.select(
+                        [
+                            "time",
+                            "plant_name",
+                            "machine_no",
+                            "sensor_id",
+                            "sensor_name",
+                            "sensor_unit",
+                            "value",
+                        ]
+                    )
+
+                    # DuckDBへ保存（Arrow形式を使用して高速化）
+                    arrow_table = data_df.to_arrow()
+
+                    # 一時テーブルとして登録
+                    conn.register("temp_sensor_data", arrow_table)
+
+                    # SQLで一括挿入（Arrow形式からの直接挿入）
+                    conn.execute("""
+                        INSERT INTO sensor_data (plant_name, machine_no, time, sensor_id, sensor_name, sensor_unit, value)
+                        SELECT plant_name, machine_no, time, sensor_id, sensor_name, sensor_unit, value 
+                        FROM temp_sensor_data
+                    """)
+                else:
+                    # 新しい形式のテーブルにデータを挿入
+                    print("新しい形式のsensor_dataテーブルにデータを挿入します")
+
+                    # ソースファイル情報とメタ情報を列として追加
+                    data_df = data_df.with_columns(
+                        [
+                            pl.lit(str(file_info["file_path"])).alias("source_file"),
+                            pl.lit(
+                                str(file_info["source_zip"])
+                                if file_info["source_zip"]
+                                else ""
+                            ).alias("source_zip"),
+                            pl.lit(meta_info.get("factory", "")).alias("factory"),
+                            pl.lit(meta_info.get("machine_id", "")).alias("machine_id"),
+                            pl.lit(meta_info.get("data_label", "")).alias("data_label"),
+                        ]
+                    )
+
+                    # DuckDBへ保存（Arrow形式を使用して高速化）
+                    arrow_table = data_df.to_arrow()
+
+                    # 一時テーブルとして登録
+                    conn.register("temp_sensor_data", arrow_table)
+
+                    # SQLで一括挿入（Arrow形式からの直接挿入）
+                    conn.execute("""
+                        INSERT INTO sensor_data 
+                        SELECT * FROM temp_sensor_data
+                    """)
 
                 # 一時テーブルを削除
                 conn.execute("DROP VIEW IF EXISTS temp_sensor_data")

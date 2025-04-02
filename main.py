@@ -1,4 +1,3 @@
-import ast
 import datetime
 import hashlib
 import os
@@ -10,55 +9,12 @@ from pathlib import Path
 
 import duckdb
 import polars as pl
+from dotenv import load_dotenv
 
 # ====== 環境変数読み込み部分 ======
 
-
-def load_env_file(env_path=".env"):
-    """
-    .envファイルから環境変数を読み込む
-
-    Parameters:
-    env_path (str): .envファイルのパス
-
-    Returns:
-    dict: 環境変数の辞書
-    """
-    env_vars = {}
-    try:
-        with open(env_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip()
-
-                # 値が引用符で囲まれている場合は引用符を削除
-                if (value.startswith('"') and value.endswith('"')) or (
-                    value.startswith("'") and value.endswith("'")
-                ):
-                    value = value[1:-1]
-
-                # 値がPythonのリテラル（リスト、辞書など）の場合はパース
-                try:
-                    value = ast.literal_eval(value)
-                except (SyntaxError, ValueError):
-                    pass
-
-                env_vars[key] = value
-    except FileNotFoundError:
-        print(f"警告: {env_path}ファイルが見つかりません。デフォルト値を使用します。")
-    except Exception as e:
-        print(f"警告: {env_path}ファイルの読み込み中にエラーが発生しました: {str(e)}")
-
-    return env_vars
-
-
 # .envファイルから環境変数を読み込む
-ENV = load_env_file()
+load_dotenv()
 
 # ====== ファイル抽出部分 ======
 
@@ -277,8 +233,13 @@ def process_csv_file(file_path):
 
     # 1~3行目はヘッダー(1行目はセンサーID、2行目はセンサー名、３行目は単位)として読み込む
     # 4行目以降はデータとして読み込む
+    encoding = os.environ.get("encoding", "utf-8")
     header_df = pl.read_csv(
-        file_path, n_rows=3, has_header=False, truncate_ragged_lines=True
+        file_path,
+        n_rows=3,
+        has_header=False,
+        truncate_ragged_lines=True,
+        encoding=encoding,
     )
 
     # 1列多く読み込まれる（最終列は不要）
@@ -290,6 +251,7 @@ def process_csv_file(file_path):
         has_header=False,
         truncate_ragged_lines=True,
         infer_schema_length=10000,  # スキーマ推論の範囲を増やす
+        encoding=encoding,
     )[:, :-1]
 
     # 列名を設定する（変換前）
@@ -587,19 +549,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--folder",
         type=str,
-        default=ENV.get("folder", "data"),
+        default=os.environ.get("folder", "data"),
         help="検索対象のフォルダパス",
     )
     parser.add_argument(
         "--pattern",
         type=str,
-        default=ENV.get("pattern", r"(Cond|User|test)"),
+        default=os.environ.get("pattern", r"(Cond|User|test)"),
         help="ファイル名フィルタリングのための正規表現パターン",
     )
     parser.add_argument(
         "--db",
         type=str,
-        default=ENV.get("db", "processed_files.duckdb"),
+        default=os.environ.get("db", "processed_files.duckdb"),
         help="処理記録用データベースファイルのパス",
     )
     parser.add_argument(

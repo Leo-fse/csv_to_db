@@ -9,4 +9,5 @@ dependencies = [
     "pandas>=2.2.3",
     "polars>=1.26.0",
     "pyarrow>=19.0.1",
+    "python-dotenv>=1.1.0",
 ]

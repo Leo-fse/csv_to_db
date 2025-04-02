@@ -161,7 +161,10 @@ def setup_database(db_path):
             sensor_name VARCHAR,
             unit VARCHAR,
             source_file VARCHAR,
-            source_zip VARCHAR
+            source_zip VARCHAR,
+            factory VARCHAR,
+            machine_id VARCHAR,
+            data_label VARCHAR
         )
     """)
 
@@ -376,7 +379,7 @@ def process_csv_file(file_path):
     return data_df
 
 
-def process_single_file(file_info, temp_dir, db_path):
+def process_single_file(file_info, temp_dir, db_path, meta_info=None):
     """
     単一のCSVファイルを処理する関数（並列処理用）
 
@@ -384,6 +387,7 @@ def process_single_file(file_info, temp_dir, db_path):
     file_info (dict): 処理するファイルの情報
     temp_dir (Path): 一時ディレクトリのパス
     db_path (str or Path): DuckDBデータベースのパス
+    meta_info (dict, optional): メタ情報（工場名、号機、データラベル名など）
 
     Returns:
     dict: 処理結果
@@ -395,17 +399,24 @@ def process_single_file(file_info, temp_dir, db_path):
         "file_hash": file_info["file_hash"],
     }
 
+    # メタ情報がない場合は空の辞書を使用
+    if meta_info is None:
+        meta_info = {"factory": "", "machine_id": "", "data_label": ""}
+
     try:
         # ファイルを処理
         data_df = process_csv_file(file_info["actual_file_path"])
         if data_df is not None:
-            # ソースファイル情報を列として追加
+            # ソースファイル情報とメタ情報を列として追加
             data_df = data_df.with_columns(
                 [
                     pl.lit(str(file_info["file_path"])).alias("source_file"),
                     pl.lit(
                         str(file_info["source_zip"]) if file_info["source_zip"] else ""
                     ).alias("source_zip"),
+                    pl.lit(meta_info.get("factory", "")).alias("factory"),
+                    pl.lit(meta_info.get("machine_id", "")).alias("machine_id"),
+                    pl.lit(meta_info.get("data_label", "")).alias("data_label"),
                 ]
             )
 
@@ -455,7 +466,7 @@ def process_single_file(file_info, temp_dir, db_path):
     return result
 
 
-def process_csv_files(csv_files, db_path, process_all=False):
+def process_csv_files(csv_files, db_path, process_all=False, meta_info=None):
     """
     CSVファイルのリストを処理する（改良版）
 
@@ -463,6 +474,7 @@ def process_csv_files(csv_files, db_path, process_all=False):
     csv_files (list): 処理するCSVファイルのリスト
     db_path (str or Path): DuckDBデータベースのパス
     process_all (bool): 処理済みファイルも再処理するかどうか
+    meta_info (dict, optional): メタ情報（工場名、号機、データラベル名など）
 
     Returns:
     dict: 処理結果の統計情報
@@ -555,7 +567,7 @@ def process_csv_files(csv_files, db_path, process_all=False):
         # 逐次処理
         print("逐次処理を開始")
         for file_info in files_to_process:
-            result = process_single_file(file_info, temp_dir, db_path)
+            result = process_single_file(file_info, temp_dir, db_path, meta_info)
             if result["success"]:
                 stats["newly_processed"] += 1
             else:
@@ -586,7 +598,7 @@ def process_csv_files(csv_files, db_path, process_all=False):
 
             # ロックを取得してファイルを処理
             with lock:
-                return process_single_file(file_info, temp_dir, db_path)
+                return process_single_file(file_info, temp_dir, db_path, meta_info)
 
         # 並列処理の実行
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -620,7 +632,15 @@ def process_csv_files(csv_files, db_path, process_all=False):
 # ====== メイン実行部分 ======
 
 
-def main(folder_path, pattern, db_path, process_all=False):
+def main(
+    folder_path,
+    pattern,
+    db_path,
+    process_all=False,
+    factory="",
+    machine_id="",
+    data_label="",
+):
     """
     メイン実行関数
 
@@ -629,15 +649,21 @@ def main(folder_path, pattern, db_path, process_all=False):
     pattern (str): 正規表現パターン
     db_path (str or Path): DuckDBデータベースのパス
     process_all (bool): 処理済みファイルも再処理するかどうか
+    factory (str): 工場名
+    machine_id (str): 号機ID
+    data_label (str): データラベル名
     """
     # ファイル検索（抽出部分）
     print(f"フォルダ {folder_path} から条件に合うCSVファイルを検索中...")
     csv_files = find_csv_files(folder_path, pattern)
     print(f"{len(csv_files)}件のファイルが見つかりました")
 
+    # メタ情報の辞書を作成
+    meta_info = {"factory": factory, "machine_id": machine_id, "data_label": data_label}
+
     # ファイル処理（処理部分）
     print("CSVファイルの処理を開始します...")
-    stats = process_csv_files(csv_files, db_path, process_all)
+    stats = process_csv_files(csv_files, db_path, process_all, meta_info)
 
     # 結果の表示
     print("\n---- 処理結果 ----")
@@ -676,8 +702,34 @@ if __name__ == "__main__":
         action="store_true",
         help="処理済みファイルも再処理する場合に指定",
     )
+    parser.add_argument(
+        "--factory",
+        type=str,
+        default="",
+        help="工場名",
+    )
+    parser.add_argument(
+        "--machine-id",
+        type=str,
+        default="",
+        help="号機ID",
+    )
+    parser.add_argument(
+        "--data-label",
+        type=str,
+        default="",
+        help="データラベル名",
+    )
 
     args = parser.parse_args()
 
     # 処理実行
-    main(args.folder, args.pattern, args.db, args.process_all)
+    main(
+        args.folder,
+        args.pattern,
+        args.db,
+        args.process_all,
+        args.factory,
+        args.machine_id,
+        args.data_label,
+    )

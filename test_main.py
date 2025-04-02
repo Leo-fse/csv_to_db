@@ -1,3 +1,9 @@
+"""
+テストモジュール
+
+リファクタリングされたコードのテストを行います。
+"""
+
 import os
 import tempfile
 import unittest
@@ -6,14 +12,12 @@ from pathlib import Path
 import duckdb
 import polars as pl
 
-from main import (
-    find_csv_files,
-    get_file_hash,
-    process_csv_file,
-    process_csv_files,
-    process_single_file,
-    setup_database,
-)
+from config import config
+from csv_processor import CsvProcessor
+from db_utils import DatabaseManager
+from file_processor import FileProcessor
+from file_utils import FileFinder, FileHasher
+from zip_handler import ZipHandler
 
 
 class TestCSVProcessing(unittest.TestCase):
@@ -36,12 +40,12 @@ class TestCSVProcessing(unittest.TestCase):
 
         # テスト用データベースを作成
         self.db_path = self.temp_path / "test.duckdb"
-        self.conn = setup_database(self.db_path)
+        self.db_manager = DatabaseManager(self.db_path)
 
     def tearDown(self):
         """テスト後のクリーンアップ"""
         # データベース接続を閉じる
-        self.conn.close()
+        self.db_manager.close()
         # 一時ディレクトリを削除
         self.temp_dir.cleanup()
 
@@ -51,8 +55,11 @@ class TestCSVProcessing(unittest.TestCase):
         (self.temp_path / "test2.csv").touch()
         (self.temp_path / "other.txt").touch()
 
+        # ファイル検索オブジェクトを作成
+        file_finder = FileFinder(r"test")
+
         # 関数を実行
-        files = find_csv_files(self.temp_path, r"test")
+        files = file_finder.find_csv_files(self.temp_path)
 
         # 結果を検証
         self.assertEqual(len(files), 2)
@@ -61,23 +68,26 @@ class TestCSVProcessing(unittest.TestCase):
     def test_get_file_hash(self):
         """get_file_hash関数のテスト"""
         # 関数を実行
-        hash1 = get_file_hash(self.test_csv_path)
+        hash1 = FileHasher.get_file_hash(self.test_csv_path)
 
         # 同じファイルのハッシュは同じになることを確認
-        hash2 = get_file_hash(self.test_csv_path)
+        hash2 = FileHasher.get_file_hash(self.test_csv_path)
         self.assertEqual(hash1, hash2)
 
         # 内容が異なるファイルのハッシュは異なることを確認
         different_file = self.temp_path / "different.csv"
         with open(different_file, "w", encoding="utf-8") as f:
             f.write("different content")
-        hash3 = get_file_hash(different_file)
+        hash3 = FileHasher.get_file_hash(different_file)
         self.assertNotEqual(hash1, hash3)
 
     def test_process_csv_file(self):
         """process_csv_file関数のテスト"""
+        # CSVプロセッサを作成
+        csv_processor = CsvProcessor(encoding="utf-8")
+
         # 関数を実行
-        result_df = process_csv_file(self.test_csv_path)
+        result_df = csv_processor.process_csv_file(self.test_csv_path)
 
         # 結果を検証
         self.assertIsInstance(result_df, pl.DataFrame)
@@ -89,32 +99,40 @@ class TestCSVProcessing(unittest.TestCase):
         self.assertIn("sensor_name", result_df.columns)
         self.assertIn("unit", result_df.columns)
 
-    def test_process_csv_files(self):
-        """process_csv_files関数のテスト"""
+    def test_file_processor(self):
+        """FileProcessorクラスのテスト"""
         # テスト用のCSVファイルリストを作成
         csv_files = [{"path": self.test_csv_path, "source_zip": None}]
 
-        # テスト用に直接ファイルを処理（並列処理を回避）
+        # ファイルプロセッサを作成
+        file_processor = FileProcessor(self.db_path)
+
+        # ファイルハッシュを計算
+        file_hash = FileHasher.get_file_hash(self.test_csv_path)
+
+        # テスト用のファイル情報を作成
         file_info = {
             "file_path": self.test_csv_path,
             "actual_file_path": self.test_csv_path,
             "source_zip": None,
             "source_zip_str": None,
-            "file_hash": get_file_hash(self.test_csv_path),
+            "file_hash": file_hash,
         }
 
-        # 単一ファイル処理関数を直接呼び出し
-        result = process_single_file(file_info, self.temp_path, self.db_path)
+        # 一時ディレクトリを作成
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # 単一ファイル処理関数を直接呼び出し
+            result = file_processor.process_single_file(file_info, Path(temp_dir))
 
-        # 結果を検証
-        self.assertTrue(result["success"])
+            # 結果を検証
+            self.assertTrue(result["success"])
 
         # データベースにデータが挿入されていることを確認
-        result = self.conn.execute("SELECT COUNT(*) FROM sensor_data").fetchone()
+        result = self.db_manager.execute("SELECT COUNT(*) FROM sensor_data").fetchone()
         self.assertGreater(result[0], 0)
 
         # 同じファイルを再度処理すると、スキップされることを確認
-        stats = process_csv_files(csv_files, self.db_path)
+        stats = file_processor.process_csv_files(csv_files)
         self.assertEqual(stats["already_processed_by_path"], 1)
 
 

@@ -254,31 +254,132 @@ class FileProcessor:
                     file_path = str(file_info["actual_file_path"])
                     lock = self.get_file_lock(file_path)
 
-                    # ロックを取得してファイルを処理
-                    with lock:
-                        return self.process_single_file(file_info, temp_dir)
+                    # 各スレッド用の独立したデータベース接続を作成
+                    thread_db_manager = DatabaseManager(self.db_path)
+
+                    try:
+                        # ロックを取得してファイルを処理
+                        with lock:
+                            # ファイルを処理
+                            result = {
+                                "success": False,
+                                "file_path": file_info["file_path"],
+                                "source_zip": file_info["source_zip"],
+                                "file_hash": file_info["file_hash"],
+                            }
+
+                            try:
+                                # ファイルを処理
+                                data_df = self.csv_processor.process_csv_file(
+                                    file_info["actual_file_path"]
+                                )
+                                if data_df is not None:
+                                    # メタ情報を追加
+                                    data_df = self.csv_processor.add_meta_info(
+                                        data_df, file_info, self.meta_info
+                                    )
+
+                                    # データベースに保存
+                                    rows_inserted = (
+                                        thread_db_manager.insert_sensor_data(data_df)
+                                    )
+
+                                    # 処理済みに記録
+                                    thread_db_manager.mark_file_as_processed(
+                                        file_info["file_path"],
+                                        file_info["file_hash"],
+                                        file_info["source_zip_str"],
+                                    )
+
+                                    # コミット
+                                    thread_db_manager.commit()
+                                    result["success"] = True
+                                    result["rows_inserted"] = rows_inserted
+                                else:
+                                    print(
+                                        f"エラー: {file_info['file_path']} の処理結果がNoneです"
+                                    )
+                            except Exception as e:
+                                # ロールバック
+                                thread_db_manager.rollback()
+
+                                print(
+                                    f"エラー処理中 {file_info['file_path']}"
+                                    + (
+                                        f" (in {file_info['source_zip']})"
+                                        if file_info["source_zip"]
+                                        else ""
+                                    )
+                                    + f": {str(e)}"
+                                )
+
+                            return result
+                    finally:
+                        # データベース接続を閉じる
+                        thread_db_manager.close()
 
                 # 並列処理の実行
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=max_workers
                 ) as executor:
                     # 各ファイルを並列処理
-                    futures = [
-                        executor.submit(process_with_lock, file_info)
-                        for file_info in files_to_process
-                    ]
+                    futures_dict = {}
+                    for file_info in files_to_process:
+                        future = executor.submit(process_with_lock, file_info)
+                        futures_dict[future] = file_info["file_path"]
+                        print(f"処理開始: {file_info['file_path']}")
+
+                    # 処理中のファイル数を追跡
+                    completed = 0
+                    total = len(futures_dict)
+
+                    # タイムアウト時間（秒）
+                    timeout = 60
 
                     # 結果を集計
-                    for future in concurrent.futures.as_completed(futures):
+                    for future in concurrent.futures.as_completed(
+                        futures_dict.keys(), timeout=timeout
+                    ):
+                        file_path = futures_dict[future]
                         try:
-                            result = future.result()
+                            result = future.result(timeout=10)  # 個別のタイムアウト
+                            completed += 1
+                            print(f"処理完了 ({completed}/{total}): {file_path}")
+
                             if result["success"]:
                                 stats["newly_processed"] += 1
+                                print(f"  成功: {file_path}")
                             else:
                                 stats["failed"] += 1
-                        except Exception as e:
-                            print(f"エラー: {str(e)}")
+                                print(f"  失敗: {file_path}")
+                        except concurrent.futures.TimeoutError:
+                            completed += 1
+                            print(
+                                f"処理タイムアウト ({completed}/{total}): {file_path}"
+                            )
                             stats["failed"] += 1
+                        except Exception as e:
+                            completed += 1
+                            print(f"処理エラー ({completed}/{total}): {file_path}")
+                            print(f"  エラー内容: {str(e)}")
+                            stats["failed"] += 1
+
+                    # 未完了のタスクをチェック
+                    remaining = [
+                        path
+                        for future, path in futures_dict.items()
+                        if not future.done()
+                    ]
+                    if remaining:
+                        print(
+                            f"警告: {len(remaining)}件のファイルが処理完了しませんでした:"
+                        )
+                        for path in remaining:
+                            print(f"  - {path}")
+                            stats["failed"] += 1
+
+                    # すべてのタスクが完了したことを確認
+                    print(f"すべてのファイル処理が完了しました: {completed}/{total}")
 
         finally:
             # 一時ディレクトリを削除

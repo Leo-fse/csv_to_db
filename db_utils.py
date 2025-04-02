@@ -22,6 +22,7 @@ class DatabaseManager:
         """
         self.db_path = Path(db_path)
         self.conn = None
+        self.read_only = False
         self.setup_database()
 
     def setup_database(self):
@@ -31,7 +32,28 @@ class DatabaseManager:
         Returns:
         duckdb.DuckDBPyConnection: データベース接続
         """
-        self.conn = duckdb.connect(str(self.db_path))
+        try:
+            # 通常モードで接続を試みる
+            self.conn = duckdb.connect(str(self.db_path))
+            self.read_only = False
+        except duckdb.IOException as e:
+            if "File is already open" in str(e):
+                print(
+                    f"警告: データベースファイル {self.db_path} は既に別のプロセスで開かれています。"
+                )
+                print("読み取り専用モードで接続を試みます...")
+                try:
+                    # 読み取り専用モードで接続を試みる
+                    self.conn = duckdb.connect(str(self.db_path), read_only=True)
+                    self.read_only = True
+                    print(
+                        "読み取り専用モードで接続しました。データの変更はできません。"
+                    )
+                except Exception as e2:
+                    print(f"エラー: 読み取り専用モードでの接続にも失敗しました: {e2}")
+                    raise
+            else:
+                raise
 
         # processed_filesテーブルを作成し、file_hashに一意性制約を追加
         self.conn.execute("""
@@ -129,6 +151,13 @@ class DatabaseManager:
         Returns:
         bool: 成功した場合はTrue
         """
+        # 読み取り専用モードの場合は何もせずにTrueを返す
+        if self.read_only:
+            print(
+                f"  情報: 読み取り専用モードのため、処理済み記録はスキップします: {file_path}"
+            )
+            return True
+
         now = datetime.datetime.now()
         source_zip_value = "" if source_zip is None else str(source_zip)
 
@@ -156,6 +185,13 @@ class DatabaseManager:
         Returns:
         int: 挿入された行数
         """
+        # 読み取り専用モードの場合は何もせずに行数を返す
+        if self.read_only:
+            print(
+                "  情報: 読み取り専用モードのため、センサーデータの挿入はスキップします"
+            )
+            return len(data_df) if data_df is not None else 0
+
         # DataFrameをArrowテーブルに変換
         arrow_table = data_df.to_arrow()
 
@@ -186,7 +222,7 @@ class DatabaseManager:
 
     def commit(self):
         """変更をコミットする"""
-        if self.conn:
+        if self.conn and not self.read_only:
             try:
                 self.conn.execute("COMMIT")
             except duckdb.duckdb.TransactionException:
@@ -195,7 +231,7 @@ class DatabaseManager:
 
     def rollback(self):
         """変更をロールバックする"""
-        if self.conn:
+        if self.conn and not self.read_only:
             try:
                 self.conn.execute("ROLLBACK")
             except duckdb.duckdb.TransactionException:

@@ -705,19 +705,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--factory",
         type=str,
-        default="",
+        default="AAA",
         help="工場名",
     )
     parser.add_argument(
         "--machine-id",
         type=str,
-        default="",
+        default="No.1",
         help="号機ID",
     )
     parser.add_argument(
         "--data-label",
         type=str,
-        default="",
+        default="２０２４年点検",
         help="データラベル名",
     )
 

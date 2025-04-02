@@ -137,12 +137,7 @@ def setup_database(db_path):
     # 既存のデータベースの場合
     if result[0] > 0:
         # processed_filesテーブルの構造を確認
-        result = conn.execute("""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'processed_files'
-        """).fetchall()
-
+        result = conn.execute("DESCRIBE processed_files").fetchall()
         column_names = [row[0] for row in result]
 
         # 古い形式のprocessed_filesテーブルの場合（file_hashカラムがない）
@@ -180,12 +175,7 @@ def setup_database(db_path):
     # sensor_dataテーブルが存在する場合
     if result[0] > 0:
         # テーブルの構造を確認
-        result = conn.execute("""
-            SELECT column_name 
-            FROM information_schema.columns 
-            WHERE table_name = 'sensor_data'
-        """).fetchall()
-
+        result = conn.execute("DESCRIBE sensor_data").fetchall()
         column_names = [row[0] for row in result]
 
         # 古い形式のsensor_dataテーブルの場合（factoryカラムがなく、plant_nameカラムがある）
@@ -460,12 +450,7 @@ def process_single_file(file_info, temp_dir, db_path, meta_info=None):
 
             try:
                 # テーブルの構造を確認
-                result = conn.execute("""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_name = 'sensor_data'
-                """).fetchall()
-
+                result = conn.execute("DESCRIBE sensor_data").fetchall()
                 column_names = [row[0] for row in result]
 
                 # 古い形式のsensor_dataテーブルの場合（factoryカラムがなく、plant_nameカラムがある）

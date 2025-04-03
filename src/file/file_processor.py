@@ -64,9 +64,9 @@ def process_file_standalone(
     temp_db_name = f"{base_name}_{process_id}_{timestamp}_{random_suffix}{ext}"
     temp_db_path = os.path.join(db_dir, temp_db_name) if db_dir else temp_db_name
 
-    # 独立したデータベース接続とCSVプロセッサを作成
+    # 独立したデータベース接続とCSVプロセッサを作成（エンコーディングを強制）
     db_manager = DatabaseManager(temp_db_path)
-    csv_processor = CsvProcessor()
+    csv_processor = CsvProcessor(force_encoding=True)
 
     result = {
         "success": False,
@@ -140,7 +140,7 @@ class FileProcessor:
         self.db_path = db_path or config.get("db")
         self.meta_info = meta_info or config.get_meta_info()
         self.db_manager = DatabaseManager(self.db_path)
-        self.csv_processor = CsvProcessor()
+        self.csv_processor = CsvProcessor(force_encoding=True)
 
         # ファイルロックを管理するための辞書
         self.file_locks = {}
@@ -289,8 +289,8 @@ class FileProcessor:
         # 各プロセス用の独立したデータベース接続を作成
         process_db_manager = DatabaseManager(db_path)
 
-        # CSVプロセッサを作成
-        csv_processor = CsvProcessor()
+        # CSVプロセッサを作成（エンコーディングを強制）
+        csv_processor = CsvProcessor(force_encoding=True)
 
         try:
             # 結果オブジェクトを初期化

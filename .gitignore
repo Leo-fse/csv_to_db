@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 data
+
+repomix-output.xml
+*.duckdb

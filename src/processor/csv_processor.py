@@ -78,9 +78,11 @@ class CsvProcessor:
                 try:
                     # ファイルの先頭部分を読み込んでエンコーディングを推測
                     with open(file_path, "rb") as f:
-                        raw_data = f.read(4096)  # 先頭4KBを読み込む
+                        raw_data = f.read(
+                            8192
+                        )  # 先頭8KBを読み込む（より多くのデータを検査）
                         logger.debug(
-                            f"ファイルの先頭4KBを読み込みました: {file_path_obj}"
+                            f"ファイルの先頭8KBを読み込みました: {file_path_obj}"
                         )
 
                         # BOMの検出
@@ -94,32 +96,27 @@ class CsvProcessor:
                             detected_encoding = "utf-16-be"
                             logger.debug("BOMを検出: UTF-16 BE")
 
-                        # 日本語エンコーディングの特徴を検出
+                        # 日本語エンコーディングの特徴を検出（改善版）
                         if not detected_encoding:
-                            # Shift-JISの特徴的なバイトパターンをチェック
-                            if any(
-                                0x81 <= b <= 0x9F or 0xE0 <= b <= 0xEF for b in raw_data
-                            ):
-                                detected_encoding = "shift-jis"
-                                logger.debug("特徴的なバイトパターンを検出: Shift-JIS")
-                            # EUC-JPの特徴的なバイトパターンをチェック
-                            elif any(
-                                0x8E <= b <= 0x8F or 0xA1 <= b <= 0xFE for b in raw_data
-                            ):
-                                detected_encoding = "euc-jp"
-                                logger.debug("特徴的なバイトパターンを検出: EUC-JP")
-                            else:
-                                # デフォルトはUTF-8を試す
+                            # 日本語エンコーディングを検出するための優先順位付きリスト
+                            encodings_to_try = ["cp932", "shift-jis", "euc-jp", "utf-8"]
+
+                            # 各エンコーディングを試す
+                            for enc in encodings_to_try:
                                 try:
-                                    raw_data.decode("utf-8")
-                                    detected_encoding = "utf-8"
-                                    logger.debug("UTF-8としてデコード可能")
+                                    # サンプルデータをデコードしてみる
+                                    raw_data.decode(enc)
+                                    detected_encoding = enc
+                                    logger.debug(f"{enc}としてデコード可能")
+                                    break
                                 except UnicodeDecodeError:
-                                    # 検出できない場合は指定されたエンコーディングを使用
-                                    detected_encoding = encoding
-                                    logger.debug(
-                                        f"エンコーディング検出失敗、デフォルト使用: {encoding}"
-                                    )
+                                    continue
+
+                            # どのエンコーディングでもデコードできなかった場合
+                            if not detected_encoding:
+                                # CP932（Windows版Shift-JIS）を優先的に使用
+                                detected_encoding = "cp932"
+                                logger.debug(f"エンコーディング検出失敗、CP932を使用")
                 except Exception as e:
                     logger.error(f"エンコーディング検出中にエラー: {str(e)}")
                     detected_encoding = encoding
@@ -128,54 +125,76 @@ class CsvProcessor:
 
                 # 検出されたエンコーディングでファイルを読み込む
                 try:
-                    # テキストモードでの読み込みを試みる
-                    logger.debug(f"テキストモードで読み込み試行: {detected_encoding}")
-                    with open(
-                        file_path, "r", encoding=detected_encoding, errors="replace"
-                    ) as src_file:
-                        content = src_file.read()
-                        with open(temp_path, "w", encoding="utf-8") as dest_file:
-                            dest_file.write(content)
-                            logger.debug(
-                                f"UTF-8に変換して一時ファイルに保存: {temp_path}"
-                            )
-                except UnicodeDecodeError:
-                    # エンコーディングエラーが発生した場合、バイナリモードで読み込み
-                    logger.warning(
-                        f"テキストモード読み込み失敗、バイナリモードで再試行: {file_path_obj}"
-                    )
+                    # バイナリモードで読み込み、より堅牢な変換を行う
+                    logger.debug(f"バイナリモードで読み込み開始: {file_path_obj}")
                     with open(file_path, "rb") as src_file:
                         content = src_file.read()
-                        # 複数のエンコーディングを試す
+
+                        # 優先順位を付けた複数のエンコーディングを試す
+                        # CP932（Windows版Shift-JIS）を最初に試す
                         encodings_to_try = [
-                            "shift-jis",
                             "cp932",
+                            "shift-jis",
                             "euc-jp",
                             "utf-8",
+                            "iso-2022-jp",
                             "latin-1",
                         ]
                         decoded = None
 
                         for enc in encodings_to_try:
                             try:
+                                # まずstrictモードで試す
                                 decoded = content.decode(enc, errors="strict")
                                 logger.info(
                                     f"エンコーディング {enc} で正常にデコードできました"
                                 )
                                 break
-                            except UnicodeDecodeError:
-                                logger.debug(f"エンコーディング {enc} でデコード失敗")
+                            except UnicodeDecodeError as e:
+                                # エラー位置を記録
+                                error_pos = e.start if hasattr(e, "start") else -1
+                                logger.debug(
+                                    f"エンコーディング {enc} でデコード失敗 (位置: {error_pos})"
+                                )
+
+                                # 特定の位置でエラーが発生した場合、部分的なデコードを試みる
+                                if error_pos > 0:
+                                    try:
+                                        # エラー位置までをデコード
+                                        partial_content = content[:error_pos]
+                                        partial_decoded = partial_content.decode(
+                                            enc, errors="strict"
+                                        )
+                                        logger.debug(
+                                            f"位置 {error_pos} までは {enc} でデコード可能"
+                                        )
+
+                                        # 残りをreplaceモードでデコード
+                                        remaining = content[error_pos:]
+                                        remaining_decoded = remaining.decode(
+                                            enc, errors="replace"
+                                        )
+
+                                        # 結合
+                                        decoded = partial_decoded + remaining_decoded
+                                        logger.info(
+                                            f"エンコーディング {enc} で部分的にデコードし、残りは置換しました"
+                                        )
+                                        break
+                                    except Exception as partial_e:
+                                        logger.debug(
+                                            f"部分デコード失敗: {str(partial_e)}"
+                                        )
                                 continue
 
                         if decoded is None:
-                            # どのエンコーディングでもデコードできない場合は、replaceモードで強制的にデコード
-                            decoded = content.decode(
-                                detected_encoding, errors="replace"
-                            )
+                            # どのエンコーディングでもデコードできない場合は、CP932でreplaceモードを使用
+                            decoded = content.decode("cp932", errors="replace")
                             logger.warning(
-                                f"警告: {detected_encoding} でエラーを置換してデコードしました"
+                                f"警告: CP932でエラーを置換してデコードしました"
                             )
 
+                        # デコードしたデータをUTF-8で一時ファイルに保存
                         with open(temp_path, "w", encoding="utf-8") as dest_file:
                             dest_file.write(decoded)
                             logger.debug(
@@ -187,10 +206,26 @@ class CsvProcessor:
                     logger.warning(
                         "最終手段: バイナリデータをそのまま書き込み、utf8-lossyで処理"
                     )
-                    with open(file_path, "rb") as src_file:
-                        content = src_file.read()
-                    with open(temp_path, "wb") as dest_file:
-                        dest_file.write(content)
+                    try:
+                        # 一度latin-1でデコードしてからUTF-8にエンコードし直す
+                        # （latin-1は任意のバイト列を文字にマッピングできる）
+                        with open(file_path, "rb") as src_file:
+                            content = src_file.read()
+                            decoded = content.decode("latin-1")
+
+                        with open(temp_path, "w", encoding="utf-8") as dest_file:
+                            dest_file.write(decoded)
+                            logger.debug(
+                                f"latin-1経由でUTF-8に変換して保存: {temp_path}"
+                            )
+                    except Exception as e2:
+                        logger.error(f"latin-1変換も失敗: {str(e2)}")
+                        # 本当の最終手段：バイナリデータをそのまま書き込む
+                        with open(file_path, "rb") as src_file:
+                            content = src_file.read()
+                        with open(temp_path, "wb") as dest_file:
+                            dest_file.write(content)
+
                     # 以降の処理ではutf8-lossyを使用
                     encoding = "utf8-lossy"
 

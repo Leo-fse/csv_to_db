@@ -536,38 +536,97 @@ class DatabaseManager:
             )
             return len(data_df) if data_df is not None else 0
 
-        # DataFrameをArrowテーブルに変換
-        arrow_table = data_df.to_arrow()
-
-        # 一時テーブルとして登録
-        self.conn.register("temp_sensor_data", arrow_table)
-
-        # トランザクションを開始
-        self.conn.execute("BEGIN TRANSACTION")
+        # データフレームが空の場合は何もしない
+        if data_df is None or len(data_df) == 0:
+            logger.warning("挿入するデータがありません")
+            return 0
 
         try:
-            # SQLで一括挿入（Arrow形式からの直接挿入）
-            self.conn.execute(
+            # エンコーディング問題を回避するため、文字列データを事前にクリーニング
+            logger.debug("データフレームの文字列カラムをクリーニング")
+            string_columns = [
+                col
+                for col in data_df.columns
+                if data_df[col].dtype == pl.Utf8 or data_df[col].dtype == pl.String
+            ]
+
+            # 文字列カラムの無効な文字を置換
+            if string_columns:
+                clean_df = data_df.with_columns(
+                    [
+                        pl.col(col).str.replace_all(
+                            r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", ""
+                        )
+                        for col in string_columns
+                    ]
+                )
+            else:
+                clean_df = data_df
+
+            # DataFrameをArrowテーブルに変換
+            try:
+                logger.debug("DataFrameをArrowテーブルに変換")
+                arrow_table = clean_df.to_arrow()
+            except Exception as arrow_err:
+                logger.error(f"Arrowテーブル変換中にエラー: {str(arrow_err)}")
+                # フォールバック: 問題のある行を特定して除外
+                logger.warning("問題のある行を特定して除外します")
+                valid_rows = []
+                for i in range(len(clean_df)):
+                    try:
+                        # 1行ずつArrowに変換を試みる
+                        row_df = clean_df.slice(i, 1)
+                        row_df.to_arrow()
+                        valid_rows.append(i)
+                    except Exception:
+                        logger.warning(f"行 {i} は変換できないためスキップします")
+
+                if not valid_rows:
+                    logger.error("有効な行がありません")
+                    return 0
+
+                # 有効な行だけのデータフレームを作成
+                clean_df = clean_df.select(valid_rows)
+                arrow_table = clean_df.to_arrow()
+                logger.info(f"クリーニング後の行数: {len(clean_df)}")
+
+            # 一時テーブルとして登録
+            self.conn.register("temp_sensor_data", arrow_table)
+
+            # トランザクションを開始
+            self.conn.execute("BEGIN TRANSACTION")
+
+            try:
+                # SQLで一括挿入（Arrow形式からの直接挿入）
+                self.conn.execute(
+                    """
+                    INSERT INTO sensor_data 
+                    SELECT * FROM temp_sensor_data
                 """
-                INSERT INTO sensor_data 
-                SELECT * FROM temp_sensor_data
-            """
-            )
+                )
 
-            # 一時テーブルを削除
-            self.conn.execute("DROP VIEW IF EXISTS temp_sensor_data")
+                # 一時テーブルを削除
+                self.conn.execute("DROP VIEW IF EXISTS temp_sensor_data")
 
-            # 挿入された行数を取得（DuckDBでは直接取得できないため、データフレームの行数を使用）
-            row_count = len(data_df) if data_df is not None else 0
-            logger.info(f"センサーデータを {row_count} 行挿入しました")
+                # コミット
+                self.conn.execute("COMMIT")
 
-            return row_count
+                # 挿入された行数を取得
+                row_count = len(clean_df)
+                logger.info(f"センサーデータを {row_count} 行挿入しました")
+
+                return row_count
+            except Exception as e:
+                # エラーが発生した場合はロールバック
+                self.conn.execute("ROLLBACK")
+                logger.error(f"センサーデータ挿入中にエラー: {str(e)}")
+                raise DatabaseOperationError(
+                    "センサーデータの挿入に失敗しました", operation="insert_sensor_data"
+                ) from e
         except Exception as e:
-            # エラーが発生した場合はロールバック
-            self.conn.execute("ROLLBACK")
-            logger.error(f"センサーデータ挿入中にエラー: {str(e)}")
+            logger.error(f"データ準備中にエラー: {str(e)}")
             raise DatabaseOperationError(
-                "センサーデータの挿入に失敗しました", operation="insert_sensor_data"
+                "センサーデータの準備に失敗しました", operation="insert_sensor_data"
             ) from e
 
     def commit(self) -> None:

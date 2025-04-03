@@ -668,8 +668,9 @@ class FileProcessor:
                                                     / total_sensor_rows
                                                 ),
                                             )
+                                            # 進捗表示をシンプルにして余分な文字が表示されないようにする
                                             print(
-                                                f"    進捗: {progress}% ({rows_processed}/{total_sensor_rows}行)"
+                                                f"    データ処理: {rows_processed}/{total_sensor_rows}行 ({progress}%完了)"
                                             )
 
                                         total_rows_merged += total_sensor_rows

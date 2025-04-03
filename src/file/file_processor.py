@@ -185,8 +185,9 @@ class FileProcessor:
                     file_path, source_zip_str
                 ):
                     stats["already_processed_by_path"] += 1
+                    file_name = Path(file_path).name
                     print(
-                        f"スキップ (既処理 - パス一致): {file_path}"
+                        f"スキップ (既処理 - ファイル名一致): {file_name}"
                         + (f" (in {source_zip})" if source_zip else "")
                     )
                     continue
@@ -209,8 +210,9 @@ class FileProcessor:
                         file_hash
                     ):
                         stats["already_processed_by_hash"] += 1
+                        file_name = Path(file_path).name
                         print(
-                            f"スキップ (既処理 - 内容一致): {file_path}"
+                            f"スキップ (既処理 - 内容一致): {file_name}"
                             + (f" (in {source_zip})" if source_zip else "")
                         )
                         continue
@@ -226,8 +228,9 @@ class FileProcessor:
                         }
                     )
                 except Exception as e:
+                    file_name = Path(file_path).name
                     print(
-                        f"エラー前処理中 {file_path}"
+                        f"エラー前処理中 {file_name}"
                         + (f" (in {source_zip})" if source_zip else "")
                         + f": {str(e)}"
                     )
@@ -304,8 +307,9 @@ class FileProcessor:
                                 # ロールバック
                                 thread_db_manager.rollback()
 
+                                file_name = Path(file_info["file_path"]).name
                                 print(
-                                    f"エラー処理中 {file_info['file_path']}"
+                                    f"エラー処理中 {file_name}"
                                     + (
                                         f" (in {file_info['source_zip']})"
                                         if file_info["source_zip"]
@@ -356,10 +360,12 @@ class FileProcessor:
 
                             if result["success"]:
                                 stats["newly_processed"] += 1
-                                print(f"  成功: {file_path}")
+                                file_name = Path(file_path).name
+                                print(f"  成功: {file_name}")
                             else:
                                 stats["failed"] += 1
-                                print(f"  失敗: {file_path}")
+                                file_name = Path(file_path).name
+                                print(f"  失敗: {file_name}")
                         except concurrent.futures.TimeoutError:
                             completed += 1
                             print(

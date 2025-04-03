@@ -76,7 +76,7 @@ def main():
         # 結果の表示
         print("\n---- 処理結果 ----")
         print(f"見つかったファイル数: {stats['total_found']}")
-        print(f"パスで既に処理済み: {stats['already_processed_by_path']}")
+        print(f"ファイル名で既に処理済み: {stats['already_processed_by_path']}")
         print(f"内容が同一で処理済み: {stats['already_processed_by_hash']}")
         print(f"新たに処理: {stats['newly_processed']}")
         print(f"処理失敗: {stats['failed']}")
@@ -89,7 +89,7 @@ def main():
             # タイムアウトが発生しても統計情報を表示
             print("\n---- 処理結果（タイムアウト発生） ----")
             print(f"見つかったファイル数: {stats['total_found']}")
-            print(f"パスで既に処理済み: {stats['already_processed_by_path']}")
+            print(f"ファイル名で既に処理済み: {stats['already_processed_by_path']}")
             print(f"内容が同一で処理済み: {stats['already_processed_by_hash']}")
             print(f"新たに処理: {stats['newly_processed']}")
             print(f"処理失敗: {stats['failed']}")

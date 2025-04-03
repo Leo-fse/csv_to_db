@@ -115,10 +115,12 @@ class DatabaseManager:
         Returns:
         bool: 処理済みの場合はTrue
         """
+        # ファイルパスからファイル名を抽出
+        file_name = Path(file_path).name
         source_zip_value = "" if source_zip is None else str(source_zip)
         result = self.conn.execute(
             "SELECT COUNT(*) FROM processed_files WHERE file_path = ? AND source_zip = ?",
-            [str(file_path), source_zip_value],
+            [file_name, source_zip_value],
         ).fetchone()
 
         return result[0] > 0
@@ -160,6 +162,8 @@ class DatabaseManager:
 
         now = datetime.datetime.now()
         source_zip_value = "" if source_zip is None else str(source_zip)
+        # ファイルパスからファイル名を抽出
+        file_name = Path(file_path).name
 
         # UPSERTパターンを使用して挿入（一意制約違反を防ぐ）
         try:
@@ -168,7 +172,7 @@ class DatabaseManager:
                 INSERT INTO processed_files (file_path, file_hash, source_zip, processed_date) 
                 VALUES (?, ?, ?, ?)
             """,
-                [str(file_path), file_hash, source_zip_value, now],
+                [file_name, file_hash, source_zip_value, now],
             )
             return True
         except duckdb.ConstraintException:
@@ -194,6 +198,8 @@ class DatabaseManager:
             return True
 
         source_zip_value = "" if source_zip is None else str(source_zip)
+        # ファイルパスからファイル名を抽出
+        file_name = Path(file_path).name
 
         try:
             # ファイルパスとソースZIPに基づいて処理済み記録を削除
@@ -202,12 +208,12 @@ class DatabaseManager:
                 DELETE FROM processed_files 
                 WHERE file_path = ? AND source_zip = ?
             """,
-                [str(file_path), source_zip_value],
+                [file_name, source_zip_value],
             )
-            print(f"  情報: {file_path} の処理済みマークを解除しました")
+            print(f"  情報: {file_name} の処理済みマークを解除しました")
             return True
         except Exception as e:
-            print(f"  警告: 処理済みマーク解除中にエラー ({file_path}): {str(e)}")
+            print(f"  警告: 処理済みマーク解除中にエラー ({file_name}): {str(e)}")
             return False
 
     def insert_sensor_data(self, data_df):

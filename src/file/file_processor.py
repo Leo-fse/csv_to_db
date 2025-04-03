@@ -164,6 +164,7 @@ class FileProcessor:
             "already_processed_by_hash": 0,
             "newly_processed": 0,
             "failed": 0,
+            "timeout": 0,  # タイムアウトによる失敗件数を追加
         }
 
         # 一時ディレクトリを作成
@@ -357,7 +358,7 @@ class FileProcessor:
                             print(
                                 f"処理タイムアウト ({completed}/{total}): {file_path}"
                             )
-                            stats["failed"] += 1
+                            stats["timeout"] += 1  # タイムアウトとしてカウント
                         except Exception as e:
                             completed += 1
                             print(f"処理エラー ({completed}/{total}): {file_path}")
@@ -376,7 +377,7 @@ class FileProcessor:
                         )
                         for path in remaining:
                             print(f"  - {path}")
-                            stats["failed"] += 1
+                            stats["timeout"] += 1  # タイムアウトとしてカウント
 
                     # すべてのタスクが完了したことを確認
                     print(f"すべてのファイル処理が完了しました: {completed}/{total}")

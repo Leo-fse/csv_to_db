@@ -5,9 +5,20 @@ DuckDBデータベースの初期化、処理済みファイル管理などの�
 """
 
 import datetime
+import enum
 from pathlib import Path
 
 import duckdb
+
+
+class ProcessStatus(enum.Enum):
+    """ファイル処理状態を表す列挙型"""
+
+    PENDING = "PENDING"  # 処理前
+    IN_PROGRESS = "IN_PROGRESS"  # 処理中
+    COMPLETED = "COMPLETED"  # 正常終了
+    FAILED = "FAILED"  # エラーで失敗
+    TIMEOUT = "TIMEOUT"  # タイムアウトで中断
 
 
 class DatabaseManager:
@@ -55,30 +66,42 @@ class DatabaseManager:
             else:
                 raise
 
-        # processed_filesテーブルを作成し、file_hashに一意性制約を追加
+        # 処理状態を管理するための列を追加したprocessed_filesテーブルを作成
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS processed_files (
                 file_path VARCHAR NOT NULL,
                 file_hash VARCHAR NOT NULL,
                 source_zip VARCHAR,
                 processed_date TIMESTAMP,
+                status VARCHAR NOT NULL DEFAULT 'COMPLETED',
+                status_updated_at TIMESTAMP,
                 PRIMARY KEY (file_path, source_zip)
             )
         """)
 
-        # file_hashに一意性インデックスが存在するか確認
-        result = self.conn.execute("""
-            SELECT COUNT(*) 
-            FROM duckdb_indexes() 
-            WHERE table_name = 'processed_files' AND index_name = 'idx_processed_files_hash'
-        """).fetchone()
+        # file_hashのインデックスを削除して再作成（トランザクションで囲む）
+        try:
+            self.conn.execute("BEGIN TRANSACTION")
 
-        # インデックスが存在しない場合は作成
-        if result[0] == 0:
+            # インデックスが存在するか確認して削除
+            result = self.conn.execute("""
+                SELECT COUNT(*) 
+                FROM duckdb_indexes() 
+                WHERE table_name = 'processed_files' AND index_name = 'idx_processed_files_hash'
+            """).fetchone()
+
+            if result[0] > 0:
+                self.conn.execute("DROP INDEX idx_processed_files_hash")
+
+            # インデックスを再作成（UNIQUEではなく普通のインデックスとして）
             self.conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_files_hash 
+                CREATE INDEX IF NOT EXISTS idx_processed_files_hash 
                 ON processed_files(file_hash)
             """)
+            self.conn.execute("COMMIT")
+        except Exception as e:
+            self.conn.execute("ROLLBACK")
+            print(f"警告: インデックス再作成中にエラー: {str(e)}")
 
         # センサーデータ格納テーブル
         self.conn.execute("""
@@ -107,6 +130,7 @@ class DatabaseManager:
     def is_file_processed_by_path(self, file_path, source_zip=None):
         """
         ファイルパスに基づいて処理済みかどうかを確認する
+        注: 完了状態（COMPLETED）のファイルのみを処理済みとみなします
 
         Parameters:
         file_path (str or Path): ファイルパス
@@ -119,8 +143,12 @@ class DatabaseManager:
         file_name = Path(file_path).name
         source_zip_value = "" if source_zip is None else str(source_zip)
         result = self.conn.execute(
-            "SELECT COUNT(*) FROM processed_files WHERE file_path = ? AND source_zip = ?",
-            [file_name, source_zip_value],
+            """
+            SELECT COUNT(*) 
+            FROM processed_files 
+            WHERE file_path = ? AND source_zip = ? AND status = ?
+            """,
+            [file_name, source_zip_value, ProcessStatus.COMPLETED.value],
         ).fetchone()
 
         return result[0] > 0
@@ -128,6 +156,7 @@ class DatabaseManager:
     def is_file_processed_by_hash(self, file_hash):
         """
         ファイルハッシュに基づいて処理済みかどうかを確認する
+        注: 完了状態（COMPLETED）のファイルのみを処理済みとみなします
 
         Parameters:
         file_hash (str): ファイルハッシュ
@@ -136,14 +165,82 @@ class DatabaseManager:
         bool: 処理済みの場合はTrue
         """
         result = self.conn.execute(
-            "SELECT COUNT(*) FROM processed_files WHERE file_hash = ?", [file_hash]
+            """
+            SELECT COUNT(*) 
+            FROM processed_files 
+            WHERE file_hash = ? AND status = ?
+            """,
+            [file_hash, ProcessStatus.COMPLETED.value],
         ).fetchone()
 
         return result[0] > 0
 
-    def mark_file_as_processed(self, file_path, file_hash, source_zip=None):
+    def update_file_status(self, file_path, file_hash, source_zip, status):
         """
-        ファイルを処理済みとしてデータベースに記録する
+        ファイルの処理状態を更新する
+
+        Parameters:
+        file_path (str or Path): ファイルパス
+        file_hash (str): ファイルハッシュ
+        source_zip (str or Path, optional): ZIPファイルパス
+        status (ProcessStatus): 処理状態
+
+        Returns:
+        bool: 成功した場合はTrue
+        """
+        # 読み取り専用モードの場合は何もせずにTrueを返す
+        if self.read_only:
+            print(
+                f"  情報: 読み取り専用モードのため、状態更新はスキップします: {file_path}"
+            )
+            return True
+
+        now = datetime.datetime.now()
+        source_zip_value = "" if source_zip is None else str(source_zip)
+        # ファイルパスからファイル名を抽出
+        file_name = Path(file_path).name
+
+        try:
+            # 既存のレコードを確認
+            result = self.conn.execute(
+                """
+                SELECT COUNT(*) 
+                FROM processed_files 
+                WHERE file_path = ? AND source_zip = ?
+                """,
+                [file_name, source_zip_value],
+            ).fetchone()
+
+            if result[0] > 0:
+                # 既存のレコードが存在する場合は更新
+                self.conn.execute(
+                    """
+                    UPDATE processed_files 
+                    SET file_hash = ?, processed_date = ?, status = ?, status_updated_at = ?
+                    WHERE file_path = ? AND source_zip = ?
+                    """,
+                    [file_hash, now, status.value, now, file_name, source_zip_value],
+                )
+            else:
+                # 新規レコードの場合は挿入
+                self.conn.execute(
+                    """
+                    INSERT INTO processed_files 
+                    (file_path, file_hash, source_zip, processed_date, status, status_updated_at) 
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    [file_name, file_hash, source_zip_value, now, status.value, now],
+                )
+
+            print(f"  情報: {file_name} の状態を {status.value} に更新しました")
+            return True
+        except Exception as e:
+            print(f"  警告: 状態更新中にエラー ({file_name}): {str(e)}")
+            return False
+
+    def mark_file_as_in_progress(self, file_path, file_hash, source_zip=None):
+        """
+        ファイルを処理中としてマークする
 
         Parameters:
         file_path (str or Path): ファイルパス
@@ -153,31 +250,72 @@ class DatabaseManager:
         Returns:
         bool: 成功した場合はTrue
         """
-        # 読み取り専用モードの場合は何もせずにTrueを返す
-        if self.read_only:
-            print(
-                f"  情報: 読み取り専用モードのため、処理済み記録はスキップします: {file_path}"
-            )
-            return True
+        return self.update_file_status(
+            file_path, file_hash, source_zip, ProcessStatus.IN_PROGRESS
+        )
 
-        now = datetime.datetime.now()
-        source_zip_value = "" if source_zip is None else str(source_zip)
-        # ファイルパスからファイル名を抽出
-        file_name = Path(file_path).name
+    def mark_file_as_completed(self, file_path, file_hash, source_zip=None):
+        """
+        ファイルを正常終了としてマークする
 
-        # UPSERTパターンを使用して挿入（一意制約違反を防ぐ）
-        try:
-            self.conn.execute(
-                """
-                INSERT INTO processed_files (file_path, file_hash, source_zip, processed_date) 
-                VALUES (?, ?, ?, ?)
-            """,
-                [file_name, file_hash, source_zip_value, now],
-            )
-            return True
-        except duckdb.ConstraintException:
-            print(f"  情報: 同一ハッシュ({file_hash})のファイルが既に処理済みです")
-            return False
+        Parameters:
+        file_path (str or Path): ファイルパス
+        file_hash (str): ファイルハッシュ
+        source_zip (str or Path, optional): ZIPファイルパス
+
+        Returns:
+        bool: 成功した場合はTrue
+        """
+        return self.update_file_status(
+            file_path, file_hash, source_zip, ProcessStatus.COMPLETED
+        )
+
+    def mark_file_as_failed(self, file_path, file_hash, source_zip=None):
+        """
+        ファイルを失敗としてマークする
+
+        Parameters:
+        file_path (str or Path): ファイルパス
+        file_hash (str): ファイルハッシュ
+        source_zip (str or Path, optional): ZIPファイルパス
+
+        Returns:
+        bool: 成功した場合はTrue
+        """
+        return self.update_file_status(
+            file_path, file_hash, source_zip, ProcessStatus.FAILED
+        )
+
+    def mark_file_as_timeout(self, file_path, file_hash, source_zip=None):
+        """
+        ファイルをタイムアウトとしてマークする
+
+        Parameters:
+        file_path (str or Path): ファイルパス
+        file_hash (str): ファイルハッシュ
+        source_zip (str or Path, optional): ZIPファイルパス
+
+        Returns:
+        bool: 成功した場合はTrue
+        """
+        return self.update_file_status(
+            file_path, file_hash, source_zip, ProcessStatus.TIMEOUT
+        )
+
+    def mark_file_as_processed(self, file_path, file_hash, source_zip=None):
+        """
+        ファイルを処理済み（COMPLETED）としてデータベースに記録する
+        注: 後方互換性のために残されています。新しいコードでは mark_file_as_completed を使用してください。
+
+        Parameters:
+        file_path (str or Path): ファイルパス
+        file_hash (str): ファイルハッシュ
+        source_zip (str or Path, optional): ZIPファイルパス
+
+        Returns:
+        bool: 成功した場合はTrue
+        """
+        return self.mark_file_as_completed(file_path, file_hash, source_zip)
 
     def unmark_file_as_processed(self, file_path, source_zip=None):
         """
@@ -215,6 +353,38 @@ class DatabaseManager:
         except Exception as e:
             print(f"  警告: 処理済みマーク解除中にエラー ({file_name}): {str(e)}")
             return False
+
+    def get_file_status(self, file_path, source_zip=None):
+        """
+        ファイルの処理状態を取得する
+
+        Parameters:
+        file_path (str or Path): ファイルパス
+        source_zip (str or Path, optional): ZIPファイルパス
+
+        Returns:
+        ProcessStatus or None: ファイルの処理状態、存在しない場合はNone
+        """
+        # ファイルパスからファイル名を抽出
+        file_name = Path(file_path).name
+        source_zip_value = "" if source_zip is None else str(source_zip)
+
+        result = self.conn.execute(
+            """
+            SELECT status 
+            FROM processed_files 
+            WHERE file_path = ? AND source_zip = ?
+            """,
+            [file_name, source_zip_value],
+        ).fetchone()
+
+        if result and result[0]:
+            # 文字列から列挙型に変換
+            for status in ProcessStatus:
+                if status.value == result[0]:
+                    return status
+
+        return None
 
     def insert_sensor_data(self, data_df):
         """

@@ -6,13 +6,40 @@ CSVファイル処理ツール
 
 import argparse
 import concurrent.futures
+import signal
+import sys
 
 from src.config.config import config
 from src.file.file_processor import FileProcessor
 
+# グローバル変数
+processor = None
+
+
+# シグナルハンドラ
+def signal_handler(sig, frame):
+    """
+    シグナルハンドラ関数
+    Ctrl+Cなどのシグナルを受け取った場合に呼び出される
+    """
+    print("\n中断シグナルを受信しました。クリーンアップを実行します...")
+
+    # グローバル変数のprocessorが存在する場合
+    if processor:
+        # キャンセルフラグを全て設定
+        for key in processor.cancel_flags.keys():
+            processor.cancel_flags[key] = True
+        print("すべての処理タスクにキャンセル要求を送信しました。")
+
+    print("プログラムを終了します。")
+    sys.exit(0)
+
 
 def main():
     """メイン実行関数"""
+    # シグナルハンドラを設定
+    signal.signal(signal.SIGINT, signal_handler)  # Ctrl+C
+    signal.signal(signal.SIGTERM, signal_handler)  # kill
     try:
         # コマンドライン引数の解析
         parser = argparse.ArgumentParser(description="CSVファイル処理ツール")
@@ -67,7 +94,8 @@ def main():
             "data_label": args.data_label,
         }
 
-        # ファイル処理オブジェクトを作成
+        # ファイル処理オブジェクトを作成（グローバル変数に設定）
+        global processor
         processor = FileProcessor(args.db, meta_info)
 
         # フォルダ内のCSVファイルを処理
@@ -85,6 +113,13 @@ def main():
             print(f"タイムアウト: {stats['timeout']}")
     except concurrent.futures.TimeoutError as e:
         print(f"\nエラー: 処理がタイムアウトしました: {str(e)}")
+
+        # キャンセルフラグを全て設定
+        if processor:
+            for key in processor.cancel_flags.keys():
+                processor.cancel_flags[key] = True
+            print("すべての処理タスクにキャンセル要求を送信しました。")
+
         if "stats" in locals():
             # タイムアウトが発生しても統計情報を表示
             print("\n---- 処理結果（タイムアウト発生） ----")
@@ -95,6 +130,8 @@ def main():
             print(f"処理失敗: {stats['failed']}")
             if "timeout" in stats:
                 print(f"タイムアウト: {stats['timeout']}")
+
+        print("\n再実行時には、タイムアウトしたファイルは再処理の対象となります。")
     except Exception as e:
         print(f"\nエラー: 処理中に例外が発生しました: {str(e)}")
 

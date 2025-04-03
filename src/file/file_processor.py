@@ -5,11 +5,15 @@ CSVファイルの検索、抽出、処理を統合的に行います。
 """
 
 import concurrent.futures
+import multiprocessing
 import os
 import re
 import shutil
+import signal
 import tempfile
 import threading
+import time
+from multiprocessing import Manager
 from pathlib import Path
 
 from src.config.config import config
@@ -17,6 +21,109 @@ from src.db.db_utils import DatabaseManager
 from src.file.file_utils import FileFinder, FileHasher
 from src.file.zip_handler import ZipHandler
 from src.processor.csv_processor import CsvProcessor
+
+
+# スタンドアロン関数（プロセス間で共有しない）
+def process_file_standalone(
+    file_path, actual_file_path, file_hash, source_zip, meta_info, db_path
+):
+    """
+    スタンドアロンで実行できるファイル処理関数（プロセス間共有なし）
+
+    Parameters:
+    file_path (str): ファイルのパス
+    actual_file_path (str): 実際のファイルパス（ZIP展開後など）
+    file_hash (str): ファイルハッシュ
+    source_zip (str): 元のZIPファイルパス（なければNone）
+    meta_info (dict): メタ情報
+    db_path (str): データベースファイルパス
+
+    Returns:
+    dict: 処理結果
+    """
+    import os
+    import random
+    import time
+    from pathlib import Path
+
+    from src.db.db_utils import DatabaseManager
+    from src.processor.csv_processor import CsvProcessor
+
+    # プロセス固有のデータベースファイル名を生成
+    process_id = os.getpid()
+    # 競合を避けるためにランダム要素と時間を追加
+    random_suffix = random.randint(1000, 9999)
+    timestamp = int(time.time() * 1000) % 10000
+
+    # 元のパスからディレクトリとファイル名を分離
+    db_dir = os.path.dirname(db_path)
+    db_name = os.path.basename(db_path)
+    base_name, ext = os.path.splitext(db_name)
+
+    # 一時データベースのパスを生成
+    temp_db_name = f"{base_name}_{process_id}_{timestamp}_{random_suffix}{ext}"
+    temp_db_path = os.path.join(db_dir, temp_db_name) if db_dir else temp_db_name
+
+    # 独立したデータベース接続とCSVプロセッサを作成
+    db_manager = DatabaseManager(temp_db_path)
+    csv_processor = CsvProcessor()
+
+    result = {
+        "success": False,
+        "file_path": file_path,
+        "source_zip": source_zip,
+        "file_hash": file_hash,
+        "temp_db_path": temp_db_path,  # 一時データベースのパスを結果に含める
+    }
+
+    try:
+        # ファイル処理前に二重チェック
+        if db_manager.is_file_processed_by_hash(file_hash):
+            result["already_processed"] = True
+            return result
+
+        # ファイルを処理
+        data_df = csv_processor.process_csv_file(actual_file_path)
+
+        if data_df is not None:
+            # メタ情報を追加
+            file_info = {"file_path": file_path, "source_zip": source_zip}
+            data_df = csv_processor.add_meta_info(data_df, file_info, meta_info)
+
+            # データベースに保存
+            rows_inserted = db_manager.insert_sensor_data(data_df)
+
+            # 処理済みに記録
+            source_zip_str = str(source_zip) if source_zip else None
+            db_manager.mark_file_as_completed(file_path, file_hash, source_zip_str)
+
+            # コミット
+            db_manager.commit()
+            result["success"] = True
+            result["rows_inserted"] = rows_inserted
+        else:
+            print(f"エラー: {file_path} の処理結果がNoneです")
+            # 失敗状態にマーク
+            source_zip_str = str(source_zip) if source_zip else None
+            db_manager.mark_file_as_failed(file_path, file_hash, source_zip_str)
+    except Exception as e:
+        # ロールバック
+        db_manager.rollback()
+
+        file_name = Path(file_path).name
+        source_zip_str = f" (in {source_zip})" if source_zip else ""
+        print(f"エラー処理中 {file_name}{source_zip_str}: {str(e)}")
+
+        # 失敗状態にマーク
+        source_zip_str = str(source_zip) if source_zip else None
+        db_manager.mark_file_as_failed(file_path, file_hash, source_zip_str)
+
+        result["error"] = str(e)
+    finally:
+        # データベース接続を閉じる
+        db_manager.close()
+
+    return result
 
 
 class FileProcessor:
@@ -38,6 +145,11 @@ class FileProcessor:
         # ファイルロックを管理するための辞書
         self.file_locks = {}
         self.lock_dict_lock = threading.Lock()
+
+        # プロセス間通信用のマネージャー
+        self.manager = Manager()
+        # キャンセルフラグを管理する共有辞書
+        self.cancel_flags = self.manager.dict()
 
     def __del__(self):
         """デストラクタ"""
@@ -146,6 +258,143 @@ class FileProcessor:
 
         return result
 
+    def process_file_in_subprocess(
+        self, file_info, process_id, db_path, meta_info, cancel_key
+    ):
+        """
+        サブプロセスでファイルを処理する関数
+
+        Parameters:
+        file_info (dict): 処理するファイルの情報
+        process_id (int): プロセスID
+        db_path (str or Path): データベースファイルのパス
+        meta_info (dict): メタ情報
+        cancel_key (str): キャンセルフラグのキー
+
+        Returns:
+        dict: 処理結果
+        """
+
+        # プロセス開始時にシグナルハンドラを設定
+        def handle_termination(signum, frame):
+            print(
+                f"プロセス {process_id} がシグナル {signum} を受信しました。終了します。"
+            )
+            # 強制終了
+            os._exit(1)
+
+        # SIGTERMシグナルのハンドラを設定
+        signal.signal(signal.SIGTERM, handle_termination)
+
+        # 各プロセス用の独立したデータベース接続を作成
+        process_db_manager = DatabaseManager(db_path)
+
+        # CSVプロセッサを作成
+        csv_processor = CsvProcessor()
+
+        try:
+            # 結果オブジェクトを初期化
+            result = {
+                "success": False,
+                "file_path": file_info["file_path"],
+                "source_zip": file_info["source_zip"],
+                "file_hash": file_info["file_hash"],
+                "process_id": process_id,
+            }
+
+            # キャンセルされていないか定期的にチェックする関数
+            # 注: この関数はダミーです。実際のキャンセルチェックはメインプロセスで行われます
+            def check_cancelled():
+                # 常にFalseを返す（キャンセルされていない）
+                # 実際のキャンセル処理はメインプロセスで行われ、タイムアウト時にプロセスが強制終了されます
+                return False
+
+            # ファイルを処理
+            data_df = csv_processor.process_csv_file(
+                file_info["actual_file_path"],
+                check_cancelled,  # キャンセルチェック関数を渡す
+            )
+
+            # キャンセルされたかチェック
+            if check_cancelled():
+                print(f"プロセス {process_id}: 処理がキャンセルされました")
+                # タイムアウト状態にマーク
+                process_db_manager.mark_file_as_timeout(
+                    file_info["file_path"],
+                    file_info["file_hash"],
+                    file_info["source_zip_str"],
+                )
+                result["cancelled"] = True
+                return result
+
+            if data_df is not None:
+                # メタ情報を追加
+                data_df = csv_processor.add_meta_info(data_df, file_info, meta_info)
+
+                # キャンセルされたかチェック
+                if check_cancelled():
+                    print(
+                        f"プロセス {process_id}: メタ情報追加後にキャンセルされました"
+                    )
+                    # タイムアウト状態にマーク
+                    process_db_manager.mark_file_as_timeout(
+                        file_info["file_path"],
+                        file_info["file_hash"],
+                        file_info["source_zip_str"],
+                    )
+                    result["cancelled"] = True
+                    return result
+
+                # データベースに保存
+                rows_inserted = process_db_manager.insert_sensor_data(data_df)
+
+                # 処理済み（完了）に記録
+                process_db_manager.mark_file_as_completed(
+                    file_info["file_path"],
+                    file_info["file_hash"],
+                    file_info["source_zip_str"],
+                )
+
+                # コミット
+                process_db_manager.commit()
+                result["success"] = True
+                result["rows_inserted"] = rows_inserted
+            else:
+                print(f"エラー: {file_info['file_path']} の処理結果がNoneです")
+                # 失敗状態にマーク
+                process_db_manager.mark_file_as_failed(
+                    file_info["file_path"],
+                    file_info["file_hash"],
+                    file_info["source_zip_str"],
+                )
+        except Exception as e:
+            # ロールバック
+            process_db_manager.rollback()
+
+            file_name = Path(file_info["file_path"]).name
+            print(
+                f"エラー処理中 {file_name}"
+                + (
+                    f" (in {file_info['source_zip']})"
+                    if file_info["source_zip"]
+                    else ""
+                )
+                + f": {str(e)}"
+            )
+
+            # 失敗状態にマーク
+            process_db_manager.mark_file_as_failed(
+                file_info["file_path"],
+                file_info["file_hash"],
+                file_info["source_zip_str"],
+            )
+
+        finally:
+            # データベース接続を閉じる
+            process_db_manager.close()
+
+        return result
+
     def process_csv_files(self, csv_files, process_all=False):
         """
         CSVファイルのリストを処理する
@@ -248,171 +497,266 @@ class FileProcessor:
                     else:
                         stats["failed"] += 1
             else:
-                # 並列処理（ThreadPoolExecutorを使用）
-                max_workers = min(4, len(files_to_process))  # 最大4スレッド
-                print(f"並列処理を開始: {max_workers}スレッド")
+                # 並列処理（ProcessPoolExecutorを使用）
+                max_workers = min(
+                    4, multiprocessing.cpu_count(), len(files_to_process)
+                )  # 最大値は手元のCPUコア数と4の小さい方
+                print(f"並列処理を開始: {max_workers}プロセス")
 
-                # ファイルロックを使用して処理する関数
-                def process_with_lock(file_info):
-                    # ファイルロックを取得
-                    file_path = str(file_info["actual_file_path"])
-                    lock = self.get_file_lock(file_path)
-
-                    # 各スレッド用の独立したデータベース接続を作成
-                    thread_db_manager = DatabaseManager(self.db_path)
-
+                # 事前に処理済みファイルを再確認
+                for file_info in files_to_process[:]:
                     try:
-                        # ロックを取得してファイルを処理
-                        with lock:
-                            # ファイルを処理
-                            result = {
-                                "success": False,
-                                "file_path": file_info["file_path"],
-                                "source_zip": file_info["source_zip"],
-                                "file_hash": file_info["file_hash"],
-                            }
+                        # 二重チェック - 別プロセスによって処理されていないか確認
+                        if self.db_manager.is_file_processed_by_hash(
+                            file_info["file_hash"]
+                        ):
+                            stats["already_processed_by_hash"] += 1
+                            files_to_process.remove(file_info)
+                            file_name = Path(file_info["file_path"]).name
+                            print(f"スキップ (既処理 - 内容一致): {file_name}")
+                            continue
+                    except Exception as e:
+                        print(f"警告: ファイル重複チェック中にエラー: {str(e)}")
 
-                            try:
-                                # ファイルを処理
-                                data_df = self.csv_processor.process_csv_file(
-                                    file_info["actual_file_path"]
-                                )
-                                if data_df is not None:
-                                    # メタ情報を追加
-                                    data_df = self.csv_processor.add_meta_info(
-                                        data_df, file_info, self.meta_info
-                                    )
+                # プロセス間で共有するキャンセルフラグをクリア
+                self.cancel_flags.clear()
 
-                                    # データベースに保存
-                                    rows_inserted = (
-                                        thread_db_manager.insert_sensor_data(data_df)
-                                    )
-
-                                    # 処理済みに記録
-                                    thread_db_manager.mark_file_as_processed(
-                                        file_info["file_path"],
-                                        file_info["file_hash"],
-                                        file_info["source_zip_str"],
-                                    )
-
-                                    # コミット
-                                    thread_db_manager.commit()
-                                    result["success"] = True
-                                    result["rows_inserted"] = rows_inserted
-                                else:
-                                    print(
-                                        f"エラー: {file_info['file_path']} の処理結果がNoneです"
-                                    )
-                            except Exception as e:
-                                # ロールバック
-                                thread_db_manager.rollback()
-
-                                file_name = Path(file_info["file_path"]).name
-                                print(
-                                    f"エラー処理中 {file_name}"
-                                    + (
-                                        f" (in {file_info['source_zip']})"
-                                        if file_info["source_zip"]
-                                        else ""
-                                    )
-                                    + f": {str(e)}"
-                                )
-
-                            return result
-                    finally:
-                        # データベース接続を閉じる
-                        thread_db_manager.close()
-
-                # タイムアウトしたファイル情報を記録するための辞書
-                timeout_files = {}
-
-                # 並列処理の実行
-                with concurrent.futures.ThreadPoolExecutor(
+                # 並列処理実行部分を修正
+                with concurrent.futures.ProcessPoolExecutor(
                     max_workers=max_workers
                 ) as executor:
                     # 各ファイルを並列処理
-                    futures_dict = {}
-                    file_info_dict = {}  # ファイル情報を保持する辞書
+                    futures = []
                     for file_info in files_to_process:
-                        future = executor.submit(process_with_lock, file_info)
-                        futures_dict[future] = file_info["file_path"]
-                        file_info_dict[file_info["file_path"]] = (
-                            file_info  # ファイル情報を保存
+                        # ProcessPoolExecutorに渡すのは単純なデータのみ
+                        future = executor.submit(
+                            process_file_standalone,  # モジュールレベルの関数を使用
+                            file_info["file_path"],
+                            file_info["actual_file_path"],
+                            file_info["file_hash"],
+                            file_info["source_zip"],
+                            self.meta_info,
+                            self.db_path,
                         )
+                        futures.append(future)
                         print(f"処理開始: {file_info['file_path']}")
 
                     # 処理中のファイル数を追跡
                     completed = 0
-                    total = len(futures_dict)
+                    total = len(futures)
 
-                    # タイムアウト時間（秒）
-                    timeout = 60
+                    # 成功した処理の一時データベースパスを保存するリスト
+                    successful_temp_dbs = []
 
                     # 結果を集計
-                    for future in concurrent.futures.as_completed(
-                        futures_dict.keys(), timeout=timeout
-                    ):
-                        file_path = futures_dict[future]
+                    for future in concurrent.futures.as_completed(futures):
                         try:
-                            result = future.result(timeout=10)  # 個別のタイムアウト
+                            result = future.result(timeout=60)  # 個別のタイムアウト
                             completed += 1
-                            print(f"処理完了 ({completed}/{total}): {file_path}")
 
-                            if result["success"]:
+                            if (
+                                "already_processed" in result
+                                and result["already_processed"]
+                            ):
+                                stats["already_processed_by_hash"] += 1
+                                print(
+                                    f"処理済みスキップ ({completed}/{total}): {result['file_path']}"
+                                )
+                            elif result["success"]:
                                 stats["newly_processed"] += 1
-                                file_name = Path(file_path).name
-                                print(f"  成功: {file_name}")
+                                print(
+                                    f"処理成功 ({completed}/{total}): {result['file_path']}"
+                                )
+                                # 成功した場合、一時データベースパスを保存
+                                if "temp_db_path" in result:
+                                    successful_temp_dbs.append(result["temp_db_path"])
                             else:
                                 stats["failed"] += 1
-                                file_name = Path(file_path).name
-                                print(f"  失敗: {file_name}")
+                                print(
+                                    f"処理失敗 ({completed}/{total}): {result['file_path']}"
+                                )
+                                if "error" in result:
+                                    print(f"  エラー内容: {result['error']}")
                         except concurrent.futures.TimeoutError:
                             completed += 1
-                            print(
-                                f"処理タイムアウト ({completed}/{total}): {file_path}"
-                            )
-                            stats["timeout"] += 1  # タイムアウトとしてカウント
-
-                            # タイムアウトしたファイルの情報を記録
-                            if file_path in file_info_dict:
-                                timeout_files[file_path] = file_info_dict[file_path]
+                            stats["timeout"] += 1
+                            print(f"処理タイムアウト ({completed}/{total})")
                         except Exception as e:
                             completed += 1
-                            print(f"処理エラー ({completed}/{total}): {file_path}")
-                            print(f"  エラー内容: {str(e)}")
                             stats["failed"] += 1
-
-                    # 未完了のタスクをチェック
-                    remaining = [
-                        path
-                        for future, path in futures_dict.items()
-                        if not future.done()
-                    ]
-                    if remaining:
-                        print(
-                            f"警告: {len(remaining)}件のファイルが処理完了しませんでした:"
-                        )
-                        for path in remaining:
-                            print(f"  - {path}")
-                            stats["timeout"] += 1  # タイムアウトとしてカウント
-
-                            # タイムアウトしたファイルの情報を記録
-                            if path in file_info_dict:
-                                timeout_files[path] = file_info_dict[path]
-
-                    # タイムアウトしたファイルをデータベースから削除（処理済みマークを解除）
-                    if timeout_files:
-                        print(
-                            f"タイムアウトした {len(timeout_files)} 件のファイルを処理済みマークから解除します"
-                        )
-                        for file_info in timeout_files.values():
-                            # ファイルが処理済みとしてマークされている場合は削除
-                            self.db_manager.unmark_file_as_processed(
-                                file_info["file_path"], file_info["source_zip_str"]
-                            )
+                            print(f"処理例外 ({completed}/{total}): {str(e)}")
 
                     # すべてのタスクが完了したことを確認
                     print(f"すべてのファイル処理が完了しました: {completed}/{total}")
+
+                    # 一時データベースからメインデータベースにデータをマージ
+                    if successful_temp_dbs:
+                        print(
+                            f"{len(successful_temp_dbs)}個の一時データベースからデータをマージします..."
+                        )
+                        merged_count = 0
+
+                        for temp_db_path in successful_temp_dbs:
+                            try:
+                                # 一時データベースからデータを読み込む
+                                temp_db_manager = DatabaseManager(temp_db_path)
+
+                                # processed_filesテーブルのデータをマージ
+                                processed_files_data = temp_db_manager.execute(
+                                    "SELECT file_path, file_hash, source_zip, processed_date, status, status_updated_at FROM processed_files"
+                                ).fetchall()
+
+                                if processed_files_data:
+                                    # デバッグ情報：最初の行のデータ型を出力
+                                    if (
+                                        processed_files_data
+                                        and len(processed_files_data) > 0
+                                    ):
+                                        first_row = processed_files_data[0]
+                                        print(
+                                            f"  デバッグ: processed_files最初の行のデータ型: {[type(val).__name__ for val in first_row]}"
+                                        )
+
+                                    for row in processed_files_data:
+                                        # メインデータベースに挿入
+                                        try:
+                                            # すべての値を文字列に変換（Noneは除く、datetime型は特別処理）
+                                            import datetime
+
+                                            converted_row = []
+                                            for val in row:
+                                                if val is None:
+                                                    converted_row.append(None)
+                                                elif isinstance(val, datetime.datetime):
+                                                    # datetime型は特別に処理
+                                                    converted_row.append(
+                                                        val.isoformat()
+                                                    )
+                                                else:
+                                                    # その他の型は通常の文字列変換
+                                                    converted_row.append(str(val))
+                                            self.db_manager.execute(
+                                                """
+                                                INSERT OR REPLACE INTO processed_files 
+                                                (file_path, file_hash, source_zip, processed_date, status, status_updated_at)
+                                                VALUES (?, ?, ?, ?, ?, ?)
+                                                """,
+                                                converted_row,
+                                            )
+                                        except Exception as e:
+                                            print(
+                                                f"  警告: processed_filesデータのマージ中にエラー: {str(e)}"
+                                            )
+
+                                # sensor_dataテーブルのデータをマージ
+                                # 大量データの場合はバッチ処理が必要かもしれませんが、ここではシンプルに実装
+                                sensor_data = temp_db_manager.execute(
+                                    "SELECT * FROM sensor_data"
+                                ).fetchall()
+
+                                if sensor_data:
+                                    # デバッグ情報：最初の行のデータ型を出力
+                                    if sensor_data and len(sensor_data) > 0:
+                                        first_row = sensor_data[0]
+                                        print(
+                                            f"  デバッグ: sensor_data最初の行のデータ型: {[type(val).__name__ for val in first_row]}"
+                                        )
+                                        print(
+                                            f"  デバッグ: sensor_data最初の行の値: {first_row}"
+                                        )
+
+                                    # カラム名を取得（col[1] にカラム名が格納されている）
+                                    columns = [
+                                        col[1]
+                                        for col in temp_db_manager.execute(
+                                            "PRAGMA table_info(sensor_data)"
+                                        ).fetchall()
+                                    ]
+                                    placeholders = ", ".join(["?"] * len(columns))
+                                    columns_str = ", ".join(columns)
+
+                                    # バッチ処理のためのリスト
+                                    batch_rows = []
+                                    batch_size = 100  # 一度に処理する行数
+
+                                    for row in sensor_data:
+                                        try:
+                                            # すべての値を文字列に変換（Noneは除く、datetime型は特別処理）
+                                            import datetime
+
+                                            converted_row = []
+                                            for val in row:
+                                                if val is None:
+                                                    converted_row.append(None)
+                                                elif isinstance(val, datetime.datetime):
+                                                    # datetime型は特別に処理
+                                                    converted_row.append(
+                                                        val.isoformat()
+                                                    )
+                                                else:
+                                                    # その他の型は通常の文字列変換
+                                                    converted_row.append(str(val))
+
+                                            # バッチに追加
+                                            batch_rows.append(converted_row)
+
+                                            # バッチサイズに達したら処理
+                                            if len(batch_rows) >= batch_size:
+                                                try:
+                                                    # バッチ挿入
+                                                    for batch_row in batch_rows:
+                                                        self.db_manager.execute(
+                                                            f"INSERT INTO sensor_data ({columns_str}) VALUES ({placeholders})",
+                                                            batch_row,
+                                                        )
+                                                    batch_rows = []  # バッチをクリア
+                                                except Exception as e:
+                                                    print(
+                                                        f"  警告: sensor_dataバッチ挿入中にエラー: {str(e)}"
+                                                    )
+                                        except Exception as e:
+                                            print(
+                                                f"  警告: sensor_dataデータの変換中にエラー: {str(e)}"
+                                            )
+
+                                    # 残りのバッチを処理
+                                    if batch_rows:
+                                        try:
+                                            for batch_row in batch_rows:
+                                                self.db_manager.execute(
+                                                    f"INSERT INTO sensor_data ({columns_str}) VALUES ({placeholders})",
+                                                    batch_row,
+                                                )
+                                        except Exception as e:
+                                            print(
+                                                f"  警告: sensor_data残りのバッチ挿入中にエラー: {str(e)}"
+                                            )
+
+                                # 一時データベース接続を閉じる
+                                temp_db_manager.close()
+
+                                # 一時データベースファイルを削除
+                                try:
+                                    os.remove(temp_db_path)
+                                    print(
+                                        f"  一時データベース {os.path.basename(temp_db_path)} を削除しました"
+                                    )
+                                except Exception as e:
+                                    print(
+                                        f"  警告: 一時データベースファイルの削除中にエラー: {str(e)}"
+                                    )
+
+                                merged_count += 1
+                            except Exception as e:
+                                print(
+                                    f"  警告: 一時データベース {temp_db_path} からのマージ中にエラー: {str(e)}"
+                                )
+
+                        # メインデータベースの変更をコミット
+                        self.db_manager.commit()
+                        print(
+                            f"{merged_count}個の一時データベースからのマージが完了しました"
+                        )
 
         finally:
             # 一時ディレクトリを削除

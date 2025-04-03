@@ -232,7 +232,8 @@ class DatabaseManager:
                     [file_name, file_hash, source_zip_value, now, status.value, now],
                 )
 
-            print(f"  情報: {file_name} の状態を {status.value} に更新しました")
+            # 進捗表示の問題を修正するためにメッセージ形式を変更
+            print(f"  ファイル状態更新: {file_name} → {status.value}")
             return True
         except Exception as e:
             print(f"  警告: 状態更新中にエラー ({file_name}): {str(e)}")

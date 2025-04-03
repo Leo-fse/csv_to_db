@@ -7,8 +7,16 @@ DuckDBデータベースの初期化、処理済みファイル管理などの�
 import datetime
 import enum
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import duckdb
+import polars as pl
+
+from src.utils.error_handlers import DatabaseOperationError, safe_operation
+from src.utils.logging_config import get_logger
+
+# ロガーの取得
+logger = get_logger("db_utils")
 
 
 class ProcessStatus(enum.Enum):
@@ -24,50 +32,62 @@ class ProcessStatus(enum.Enum):
 class DatabaseManager:
     """データベース操作を行うクラス"""
 
-    def __init__(self, db_path):
+    def __init__(self, db_path: Union[str, Path]) -> None:
         """
         初期化
 
         Parameters:
-        db_path (str or Path): データベースファイルのパス
+            db_path (str or Path): データベースファイルのパス
         """
         self.db_path = Path(db_path)
-        self.conn = None
-        self.read_only = False
+        self.conn: Optional[duckdb.DuckDBPyConnection] = None
+        self.read_only: bool = False
         self.setup_database()
 
-    def setup_database(self):
+    def setup_database(self) -> duckdb.DuckDBPyConnection:
         """
         データベースを初期化する
 
         Returns:
-        duckdb.DuckDBPyConnection: データベース接続
+            duckdb.DuckDBPyConnection: データベース接続
         """
         try:
             # 通常モードで接続を試みる
             self.conn = duckdb.connect(str(self.db_path))
             self.read_only = False
+            logger.debug(f"データベースに接続しました: {self.db_path}")
         except duckdb.IOException as e:
             if "File is already open" in str(e):
-                print(
-                    f"警告: データベースファイル {self.db_path} は既に別のプロセスで開かれています。"
+                logger.warning(
+                    f"データベースファイル {self.db_path} は既に別のプロセスで開かれています。"
                 )
-                print("読み取り専用モードで接続を試みます...")
+                logger.info("読み取り専用モードで接続を試みます...")
                 try:
                     # 読み取り専用モードで接続を試みる
                     self.conn = duckdb.connect(str(self.db_path), read_only=True)
                     self.read_only = True
-                    print(
+                    logger.info(
                         "読み取り専用モードで接続しました。データの変更はできません。"
                     )
                 except Exception as e2:
-                    print(f"エラー: 読み取り専用モードでの接続にも失敗しました: {e2}")
-                    raise
+                    logger.error(f"読み取り専用モードでの接続にも失敗しました: {e2}")
+                    raise DatabaseOperationError(
+                        "データベース接続に失敗しました", operation="connect"
+                    ) from e2
             else:
-                raise
+                logger.error(f"データベース接続エラー: {str(e)}")
+                raise DatabaseOperationError(
+                    "データベース接続に失敗しました", operation="connect"
+                ) from e
+
+        if self.conn is None:
+            raise DatabaseOperationError(
+                "データベース接続が確立できませんでした", operation="connect"
+            )
 
         # 処理状態を管理するための列を追加したprocessed_filesテーブルを作成
-        self.conn.execute("""
+        self.conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS processed_files (
                 file_path VARCHAR NOT NULL,
                 file_hash VARCHAR NOT NULL,
@@ -77,34 +97,44 @@ class DatabaseManager:
                 status_updated_at TIMESTAMP,
                 PRIMARY KEY (file_path, source_zip)
             )
-        """)
+        """
+        )
 
         # file_hashのインデックスを削除して再作成（トランザクションで囲む）
         try:
             self.conn.execute("BEGIN TRANSACTION")
 
             # インデックスが存在するか確認して削除
-            result = self.conn.execute("""
+            result = self.conn.execute(
+                """
                 SELECT COUNT(*) 
                 FROM duckdb_indexes() 
                 WHERE table_name = 'processed_files' AND index_name = 'idx_processed_files_hash'
-            """).fetchone()
+            """
+            ).fetchone()
 
             if result[0] > 0:
                 self.conn.execute("DROP INDEX idx_processed_files_hash")
+                logger.debug(
+                    "既存のインデックス idx_processed_files_hash を削除しました"
+                )
 
             # インデックスを再作成（UNIQUEではなく普通のインデックスとして）
-            self.conn.execute("""
+            self.conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_processed_files_hash 
                 ON processed_files(file_hash)
-            """)
+            """
+            )
             self.conn.execute("COMMIT")
+            logger.debug("インデックス idx_processed_files_hash を作成しました")
         except Exception as e:
             self.conn.execute("ROLLBACK")
-            print(f"警告: インデックス再作成中にエラー: {str(e)}")
+            logger.warning(f"インデックス再作成中にエラー: {str(e)}")
 
         # センサーデータ格納テーブル
-        self.conn.execute("""
+        self.conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS sensor_data (
                 Time TIMESTAMP,
                 value VARCHAR,
@@ -117,81 +147,122 @@ class DatabaseManager:
                 machine_id VARCHAR,
                 data_label VARCHAR
             )
-        """)
+        """
+        )
+        logger.debug("テーブル構造を確認しました")
 
-        return self.conn
+        return cast(duckdb.DuckDBPyConnection, self.conn)
 
-    def close(self):
+    def close(self) -> None:
         """データベース接続を閉じる"""
         if self.conn:
             self.conn.close()
             self.conn = None
+            logger.debug(f"データベース接続を閉じました: {self.db_path}")
 
-    def is_file_processed_by_path(self, file_path, source_zip=None):
+    def is_file_processed_by_path(
+        self, file_path: Union[str, Path], source_zip: Optional[Union[str, Path]] = None
+    ) -> bool:
         """
         ファイルパスに基づいて処理済みかどうかを確認する
         注: 完了状態（COMPLETED）のファイルのみを処理済みとみなします
 
         Parameters:
-        file_path (str or Path): ファイルパス
-        source_zip (str or Path, optional): ZIPファイルパス
+            file_path (str or Path): ファイルパス
+            source_zip (str or Path, optional): ZIPファイルパス
 
         Returns:
-        bool: 処理済みの場合はTrue
+            bool: 処理済みの場合はTrue
         """
+        if self.conn is None:
+            logger.error("データベース接続が確立されていません")
+            return False
+
         # ファイルパスからファイル名を抽出
         file_name = Path(file_path).name
         source_zip_value = "" if source_zip is None else str(source_zip)
-        result = self.conn.execute(
-            """
-            SELECT COUNT(*) 
-            FROM processed_files 
-            WHERE file_path = ? AND source_zip = ? AND status = ?
-            """,
-            [file_name, source_zip_value, ProcessStatus.COMPLETED.value],
-        ).fetchone()
 
-        return result[0] > 0
+        try:
+            result = self.conn.execute(
+                """
+                SELECT COUNT(*) 
+                FROM processed_files 
+                WHERE file_path = ? AND source_zip = ? AND status = ?
+                """,
+                [file_name, source_zip_value, ProcessStatus.COMPLETED.value],
+            ).fetchone()
 
-    def is_file_processed_by_hash(self, file_hash):
+            is_processed = result[0] > 0
+            logger.debug(
+                f"ファイルパスによる処理済みチェック: {file_name} "
+                f"(source_zip: {source_zip_value}) -> {is_processed}"
+            )
+            return is_processed
+        except Exception as e:
+            logger.error(f"ファイル処理状態チェック中にエラー: {str(e)}")
+            return False
+
+    def is_file_processed_by_hash(self, file_hash: str) -> bool:
         """
         ファイルハッシュに基づいて処理済みかどうかを確認する
         注: 完了状態（COMPLETED）のファイルのみを処理済みとみなします
 
         Parameters:
-        file_hash (str): ファイルハッシュ
+            file_hash (str): ファイルハッシュ
 
         Returns:
-        bool: 処理済みの場合はTrue
+            bool: 処理済みの場合はTrue
         """
-        result = self.conn.execute(
-            """
-            SELECT COUNT(*) 
-            FROM processed_files 
-            WHERE file_hash = ? AND status = ?
-            """,
-            [file_hash, ProcessStatus.COMPLETED.value],
-        ).fetchone()
+        if self.conn is None:
+            logger.error("データベース接続が確立されていません")
+            return False
 
-        return result[0] > 0
+        try:
+            result = self.conn.execute(
+                """
+                SELECT COUNT(*) 
+                FROM processed_files 
+                WHERE file_hash = ? AND status = ?
+                """,
+                [file_hash, ProcessStatus.COMPLETED.value],
+            ).fetchone()
 
-    def update_file_status(self, file_path, file_hash, source_zip, status):
+            is_processed = result[0] > 0
+            logger.debug(
+                f"ファイルハッシュによる処理済みチェック: {file_hash} -> {is_processed}"
+            )
+            return is_processed
+        except Exception as e:
+            logger.error(f"ファイルハッシュチェック中にエラー: {str(e)}")
+            return False
+
+    def update_file_status(
+        self,
+        file_path: Union[str, Path],
+        file_hash: str,
+        source_zip: Optional[Union[str, Path]],
+        status: ProcessStatus,
+    ) -> bool:
         """
         ファイルの処理状態を更新する
 
         Parameters:
-        file_path (str or Path): ファイルパス
-        file_hash (str): ファイルハッシュ
-        source_zip (str or Path, optional): ZIPファイルパス
-        status (ProcessStatus): 処理状態
+            file_path (str or Path): ファイルパス
+            file_hash (str): ファイルハッシュ
+            source_zip (str or Path, optional): ZIPファイルパス
+            status (ProcessStatus): 処理状態
 
         Returns:
-        bool: 成功した場合はTrue
+            bool: 成功した場合はTrue
         """
+        if self.conn is None:
+            logger.error("データベース接続が確立されていません")
+            return False
+
         # 読み取り専用モードの場合は何もせずにTrueを返す
         if self.read_only:
-            print(
-                f"  情報: 読み取り専用モードのため、状態更新はスキップします: {file_path}"
+            logger.info(
+                f"読み取り専用モードのため、状態更新はスキップします: {file_path}"
             )
             return True
 
@@ -221,6 +292,10 @@ class DatabaseManager:
                     """,
                     [file_hash, now, status.value, now, file_name, source_zip_value],
                 )
+                logger.debug(
+                    f"ファイル状態を更新しました: {file_name} "
+                    f"(source_zip: {source_zip_value}) -> {status.value}"
+                )
             else:
                 # 新規レコードの場合は挿入
                 self.conn.execute(
@@ -231,108 +306,144 @@ class DatabaseManager:
                     """,
                     [file_name, file_hash, source_zip_value, now, status.value, now],
                 )
+                logger.debug(
+                    f"ファイル状態を新規登録しました: {file_name} "
+                    f"(source_zip: {source_zip_value}) -> {status.value}"
+                )
 
-            # 進捗表示の問題を修正するためにメッセージ形式を変更
-            print(f"  ファイル状態更新: {file_name} → {status.value}")
             return True
         except Exception as e:
-            print(f"  警告: 状態更新中にエラー ({file_name}): {str(e)}")
+            logger.error(f"状態更新中にエラー ({file_name}): {str(e)}")
             return False
 
-    def mark_file_as_in_progress(self, file_path, file_hash, source_zip=None):
+    def mark_file_as_in_progress(
+        self,
+        file_path: Union[str, Path],
+        file_hash: str,
+        source_zip: Optional[Union[str, Path]] = None,
+    ) -> bool:
         """
         ファイルを処理中としてマークする
 
         Parameters:
-        file_path (str or Path): ファイルパス
-        file_hash (str): ファイルハッシュ
-        source_zip (str or Path, optional): ZIPファイルパス
+            file_path (str or Path): ファイルパス
+            file_hash (str): ファイルハッシュ
+            source_zip (str or Path, optional): ZIPファイルパス
 
         Returns:
-        bool: 成功した場合はTrue
+            bool: 成功した場合はTrue
         """
         return self.update_file_status(
             file_path, file_hash, source_zip, ProcessStatus.IN_PROGRESS
         )
 
-    def mark_file_as_completed(self, file_path, file_hash, source_zip=None):
+    def mark_file_as_completed(
+        self,
+        file_path: Union[str, Path],
+        file_hash: str,
+        source_zip: Optional[Union[str, Path]] = None,
+    ) -> bool:
         """
         ファイルを正常終了としてマークする
 
         Parameters:
-        file_path (str or Path): ファイルパス
-        file_hash (str): ファイルハッシュ
-        source_zip (str or Path, optional): ZIPファイルパス
+            file_path (str or Path): ファイルパス
+            file_hash (str): ファイルハッシュ
+            source_zip (str or Path, optional): ZIPファイルパス
 
         Returns:
-        bool: 成功した場合はTrue
+            bool: 成功した場合はTrue
         """
         return self.update_file_status(
             file_path, file_hash, source_zip, ProcessStatus.COMPLETED
         )
 
-    def mark_file_as_failed(self, file_path, file_hash, source_zip=None):
+    def mark_file_as_failed(
+        self,
+        file_path: Union[str, Path],
+        file_hash: str,
+        source_zip: Optional[Union[str, Path]] = None,
+    ) -> bool:
         """
         ファイルを失敗としてマークする
 
         Parameters:
-        file_path (str or Path): ファイルパス
-        file_hash (str): ファイルハッシュ
-        source_zip (str or Path, optional): ZIPファイルパス
+            file_path (str or Path): ファイルパス
+            file_hash (str): ファイルハッシュ
+            source_zip (str or Path, optional): ZIPファイルパス
 
         Returns:
-        bool: 成功した場合はTrue
+            bool: 成功した場合はTrue
         """
         return self.update_file_status(
             file_path, file_hash, source_zip, ProcessStatus.FAILED
         )
 
-    def mark_file_as_timeout(self, file_path, file_hash, source_zip=None):
+    def mark_file_as_timeout(
+        self,
+        file_path: Union[str, Path],
+        file_hash: str,
+        source_zip: Optional[Union[str, Path]] = None,
+    ) -> bool:
         """
         ファイルをタイムアウトとしてマークする
 
         Parameters:
-        file_path (str or Path): ファイルパス
-        file_hash (str): ファイルハッシュ
-        source_zip (str or Path, optional): ZIPファイルパス
+            file_path (str or Path): ファイルパス
+            file_hash (str): ファイルハッシュ
+            source_zip (str or Path, optional): ZIPファイルパス
 
         Returns:
-        bool: 成功した場合はTrue
+            bool: 成功した場合はTrue
         """
         return self.update_file_status(
             file_path, file_hash, source_zip, ProcessStatus.TIMEOUT
         )
 
-    def mark_file_as_processed(self, file_path, file_hash, source_zip=None):
+    def mark_file_as_processed(
+        self,
+        file_path: Union[str, Path],
+        file_hash: str,
+        source_zip: Optional[Union[str, Path]] = None,
+    ) -> bool:
         """
         ファイルを処理済み（COMPLETED）としてデータベースに記録する
         注: 後方互換性のために残されています。新しいコードでは mark_file_as_completed を使用してください。
 
         Parameters:
-        file_path (str or Path): ファイルパス
-        file_hash (str): ファイルハッシュ
-        source_zip (str or Path, optional): ZIPファイルパス
+            file_path (str or Path): ファイルパス
+            file_hash (str): ファイルハッシュ
+            source_zip (str or Path, optional): ZIPファイルパス
 
         Returns:
-        bool: 成功した場合はTrue
+            bool: 成功した場合はTrue
         """
+        logger.debug(
+            f"mark_file_as_processed は非推奨です。代わりに mark_file_as_completed を使用してください。"
+        )
         return self.mark_file_as_completed(file_path, file_hash, source_zip)
 
-    def unmark_file_as_processed(self, file_path, source_zip=None):
+    def unmark_file_as_processed(
+        self, file_path: Union[str, Path], source_zip: Optional[Union[str, Path]] = None
+    ) -> bool:
         """
         ファイルの処理済みマークをデータベースから削除する
 
         Parameters:
-        file_path (str or Path): ファイルパス
-        source_zip (str or Path, optional): ZIPファイルパス
+            file_path (str or Path): ファイルパス
+            source_zip (str or Path, optional): ZIPファイルパス
 
         Returns:
-        bool: 成功した場合はTrue
+            bool: 成功した場合はTrue
         """
+        if self.conn is None:
+            logger.error("データベース接続が確立されていません")
+            return False
+
         # 読み取り専用モードの場合は何もせずにTrueを返す
         if self.read_only:
-            print(
-                f"  情報: 読み取り専用モードのため、処理済み記録の削除はスキップします: {file_path}"
+            logger.info(
+                f"読み取り専用モードのため、処理済み記録の削除はスキップします: {file_path}"
             )
             return True
 
@@ -349,58 +460,79 @@ class DatabaseManager:
             """,
                 [file_name, source_zip_value],
             )
-            print(f"  情報: {file_name} の処理済みマークを解除しました")
+            logger.info(f"{file_name} の処理済みマークを解除しました")
             return True
         except Exception as e:
-            print(f"  警告: 処理済みマーク解除中にエラー ({file_name}): {str(e)}")
+            logger.error(f"処理済みマーク解除中にエラー ({file_name}): {str(e)}")
             return False
 
-    def get_file_status(self, file_path, source_zip=None):
+    def get_file_status(
+        self, file_path: Union[str, Path], source_zip: Optional[Union[str, Path]] = None
+    ) -> Optional[ProcessStatus]:
         """
         ファイルの処理状態を取得する
 
         Parameters:
-        file_path (str or Path): ファイルパス
-        source_zip (str or Path, optional): ZIPファイルパス
+            file_path (str or Path): ファイルパス
+            source_zip (str or Path, optional): ZIPファイルパス
 
         Returns:
-        ProcessStatus or None: ファイルの処理状態、存在しない場合はNone
+            ProcessStatus or None: ファイルの処理状態、存在しない場合はNone
         """
+        if self.conn is None:
+            logger.error("データベース接続が確立されていません")
+            return None
+
         # ファイルパスからファイル名を抽出
         file_name = Path(file_path).name
         source_zip_value = "" if source_zip is None else str(source_zip)
 
-        result = self.conn.execute(
-            """
-            SELECT status 
-            FROM processed_files 
-            WHERE file_path = ? AND source_zip = ?
-            """,
-            [file_name, source_zip_value],
-        ).fetchone()
+        try:
+            result = self.conn.execute(
+                """
+                SELECT status 
+                FROM processed_files 
+                WHERE file_path = ? AND source_zip = ?
+                """,
+                [file_name, source_zip_value],
+            ).fetchone()
 
-        if result and result[0]:
-            # 文字列から列挙型に変換
-            for status in ProcessStatus:
-                if status.value == result[0]:
-                    return status
+            if result and result[0]:
+                # 文字列から列挙型に変換
+                for status in ProcessStatus:
+                    if status.value == result[0]:
+                        logger.debug(
+                            f"ファイル状態を取得: {file_name} "
+                            f"(source_zip: {source_zip_value}) -> {status.value}"
+                        )
+                        return status
 
-        return None
+            logger.debug(
+                f"ファイル状態が見つかりません: {file_name} (source_zip: {source_zip_value})"
+            )
+            return None
+        except Exception as e:
+            logger.error(f"ファイル状態取得中にエラー ({file_name}): {str(e)}")
+            return None
 
-    def insert_sensor_data(self, data_df):
+    def insert_sensor_data(self, data_df: pl.DataFrame) -> int:
         """
         センサーデータをデータベースに挿入する
 
         Parameters:
-        data_df: Polars DataFrame
+            data_df (pl.DataFrame): Polars DataFrame
 
         Returns:
-        int: 挿入された行数
+            int: 挿入された行数
         """
+        if self.conn is None:
+            logger.error("データベース接続が確立されていません")
+            return 0
+
         # 読み取り専用モードの場合は何もせずに行数を返す
         if self.read_only:
-            print(
-                "  情報: 読み取り専用モードのため、センサーデータの挿入はスキップします"
+            logger.info(
+                "読み取り専用モードのため、センサーデータの挿入はスキップします"
             )
             return len(data_df) if data_df is not None else 0
 
@@ -415,52 +547,88 @@ class DatabaseManager:
 
         try:
             # SQLで一括挿入（Arrow形式からの直接挿入）
-            result = self.conn.execute("""
+            self.conn.execute(
+                """
                 INSERT INTO sensor_data 
                 SELECT * FROM temp_sensor_data
-            """)
+            """
+            )
 
             # 一時テーブルを削除
             self.conn.execute("DROP VIEW IF EXISTS temp_sensor_data")
 
             # 挿入された行数を取得（DuckDBでは直接取得できないため、データフレームの行数を使用）
             row_count = len(data_df) if data_df is not None else 0
+            logger.info(f"センサーデータを {row_count} 行挿入しました")
 
             return row_count
         except Exception as e:
             # エラーが発生した場合はロールバック
             self.conn.execute("ROLLBACK")
-            raise e
+            logger.error(f"センサーデータ挿入中にエラー: {str(e)}")
+            raise DatabaseOperationError(
+                "センサーデータの挿入に失敗しました", operation="insert_sensor_data"
+            ) from e
 
-    def commit(self):
+    def commit(self) -> None:
         """変更をコミットする"""
-        if self.conn and not self.read_only:
+        if self.conn is None:
+            logger.error("データベース接続が確立されていません")
+            return
+
+        if not self.read_only:
             try:
                 self.conn.execute("COMMIT")
+                logger.debug("トランザクションをコミットしました")
             except duckdb.duckdb.TransactionException:
                 # トランザクションがアクティブでない場合は無視
+                logger.debug(
+                    "コミットをスキップ: アクティブなトランザクションがありません"
+                )
                 pass
 
-    def rollback(self):
+    def rollback(self) -> None:
         """変更をロールバックする"""
-        if self.conn and not self.read_only:
+        if self.conn is None:
+            logger.error("データベース接続が確立されていません")
+            return
+
+        if not self.read_only:
             try:
                 self.conn.execute("ROLLBACK")
+                logger.debug("トランザクションをロールバックしました")
             except duckdb.duckdb.TransactionException:
                 # トランザクションがアクティブでない場合は無視
+                logger.debug(
+                    "ロールバックをスキップ: アクティブなトランザクションがありません"
+                )
                 pass
 
-    def execute(self, query, params=None):
+    def execute(self, query: str, params: Optional[List[Any]] = None) -> Any:
         """
         SQLクエリを実行する
 
         Parameters:
-        query (str): SQLクエリ
-        params (list, optional): クエリパラメータ
+            query (str): SQLクエリ
+            params (list, optional): クエリパラメータ
 
         Returns:
-        duckdb.DuckDBPyResult: クエリ結果
+            duckdb.DuckDBPyResult: クエリ結果
         """
-        if params:
-            return self.conn.execute(query, params)
-        return self.conn.execute(query)
+        if self.conn is None:
+            logger.error("データベース接続が確立されていません")
+            raise DatabaseOperationError(
+                "データベース接続が確立されていません", operation="execute"
+            )
+
+        try:
+            if params:
+                logger.debug(f"SQLクエリを実行: {query} (パラメータあり)")
+                return self.conn.execute(query, params)
+            logger.debug(f"SQLクエリを実行: {query}")
+            return self.conn.execute(query)
+        except Exception as e:
+            logger.error(f"SQLクエリ実行中にエラー: {str(e)}")
+            raise DatabaseOperationError(
+                f"SQLクエリの実行に失敗しました: {query}", operation="execute"
+            ) from e

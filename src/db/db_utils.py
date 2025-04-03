@@ -175,6 +175,41 @@ class DatabaseManager:
             print(f"  情報: 同一ハッシュ({file_hash})のファイルが既に処理済みです")
             return False
 
+    def unmark_file_as_processed(self, file_path, source_zip=None):
+        """
+        ファイルの処理済みマークをデータベースから削除する
+
+        Parameters:
+        file_path (str or Path): ファイルパス
+        source_zip (str or Path, optional): ZIPファイルパス
+
+        Returns:
+        bool: 成功した場合はTrue
+        """
+        # 読み取り専用モードの場合は何もせずにTrueを返す
+        if self.read_only:
+            print(
+                f"  情報: 読み取り専用モードのため、処理済み記録の削除はスキップします: {file_path}"
+            )
+            return True
+
+        source_zip_value = "" if source_zip is None else str(source_zip)
+
+        try:
+            # ファイルパスとソースZIPに基づいて処理済み記録を削除
+            self.conn.execute(
+                """
+                DELETE FROM processed_files 
+                WHERE file_path = ? AND source_zip = ?
+            """,
+                [str(file_path), source_zip_value],
+            )
+            print(f"  情報: {file_path} の処理済みマークを解除しました")
+            return True
+        except Exception as e:
+            print(f"  警告: 処理済みマーク解除中にエラー ({file_path}): {str(e)}")
+            return False
+
     def insert_sensor_data(self, data_df):
         """
         センサーデータをデータベースに挿入する

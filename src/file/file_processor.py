@@ -319,15 +319,22 @@ class FileProcessor:
                         # データベース接続を閉じる
                         thread_db_manager.close()
 
+                # タイムアウトしたファイル情報を記録するための辞書
+                timeout_files = {}
+
                 # 並列処理の実行
                 with concurrent.futures.ThreadPoolExecutor(
                     max_workers=max_workers
                 ) as executor:
                     # 各ファイルを並列処理
                     futures_dict = {}
+                    file_info_dict = {}  # ファイル情報を保持する辞書
                     for file_info in files_to_process:
                         future = executor.submit(process_with_lock, file_info)
                         futures_dict[future] = file_info["file_path"]
+                        file_info_dict[file_info["file_path"]] = (
+                            file_info  # ファイル情報を保存
+                        )
                         print(f"処理開始: {file_info['file_path']}")
 
                     # 処理中のファイル数を追跡
@@ -359,6 +366,10 @@ class FileProcessor:
                                 f"処理タイムアウト ({completed}/{total}): {file_path}"
                             )
                             stats["timeout"] += 1  # タイムアウトとしてカウント
+
+                            # タイムアウトしたファイルの情報を記録
+                            if file_path in file_info_dict:
+                                timeout_files[file_path] = file_info_dict[file_path]
                         except Exception as e:
                             completed += 1
                             print(f"処理エラー ({completed}/{total}): {file_path}")
@@ -378,6 +389,21 @@ class FileProcessor:
                         for path in remaining:
                             print(f"  - {path}")
                             stats["timeout"] += 1  # タイムアウトとしてカウント
+
+                            # タイムアウトしたファイルの情報を記録
+                            if path in file_info_dict:
+                                timeout_files[path] = file_info_dict[path]
+
+                    # タイムアウトしたファイルをデータベースから削除（処理済みマークを解除）
+                    if timeout_files:
+                        print(
+                            f"タイムアウトした {len(timeout_files)} 件のファイルを処理済みマークから解除します"
+                        )
+                        for file_info in timeout_files.values():
+                            # ファイルが処理済みとしてマークされている場合は削除
+                            self.db_manager.unmark_file_as_processed(
+                                file_info["file_path"], file_info["source_zip_str"]
+                            )
 
                     # すべてのタスクが完了したことを確認
                     print(f"すべてのファイル処理が完了しました: {completed}/{total}")

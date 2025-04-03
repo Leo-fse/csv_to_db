@@ -591,172 +591,140 @@ class FileProcessor:
 
                     # 一時データベースからメインデータベースにデータをマージ
                     if successful_temp_dbs:
+                        total_dbs = len(successful_temp_dbs)
                         print(
-                            f"{len(successful_temp_dbs)}個の一時データベースからデータをマージします..."
+                            f"{total_dbs}個の一時データベースからデータをマージします..."
                         )
                         merged_count = 0
+                        total_rows_merged = 0
 
-                        for temp_db_path in successful_temp_dbs:
+                        # メインデータベースのコネクションを取得
+                        main_conn = self.db_manager.conn
+
+                        for idx, temp_db_path in enumerate(successful_temp_dbs, 1):
                             try:
-                                # 一時データベースからデータを読み込む
-                                temp_db_manager = DatabaseManager(temp_db_path)
+                                print(
+                                    f"  データベース {idx}/{total_dbs} をマージ中... ({os.path.basename(temp_db_path)})"
+                                )
 
-                                # processed_filesテーブルのデータをマージ
-                                processed_files_data = temp_db_manager.execute(
-                                    "SELECT file_path, file_hash, source_zip, processed_date, status, status_updated_at FROM processed_files"
-                                ).fetchall()
+                                # ATTACH DATABASE コマンドを使用して一時データベースを接続
+                                temp_db_name = f"temp_db_{idx}"
+                                main_conn.execute(
+                                    f"ATTACH DATABASE '{temp_db_path}' AS {temp_db_name}"
+                                )
 
-                                if processed_files_data:
-                                    # デバッグ情報：最初の行のデータ型を出力
-                                    if (
-                                        processed_files_data
-                                        and len(processed_files_data) > 0
-                                    ):
-                                        first_row = processed_files_data[0]
+                                try:
+                                    # トランザクションを開始
+                                    main_conn.execute("BEGIN TRANSACTION")
+
+                                    # processed_filesテーブルのデータをマージ（SQLを使用して直接コピー）
+                                    processed_count = main_conn.execute(f"""
+                                        INSERT OR REPLACE INTO main.processed_files 
+                                        SELECT * FROM {temp_db_name}.processed_files
+                                    """).fetchone()[0]
+
+                                    print(
+                                        f"    processed_filesテーブル: {processed_count}行をマージしました"
+                                    )
+
+                                    # sensor_dataテーブルのデータをマージ（SQLを使用して直接コピー）
+                                    # 行数をカウントするためのクエリ
+                                    row_count_query = f"SELECT COUNT(*) FROM {temp_db_name}.sensor_data"
+                                    total_sensor_rows = main_conn.execute(
+                                        row_count_query
+                                    ).fetchone()[0]
+
+                                    if total_sensor_rows > 0:
                                         print(
-                                            f"  デバッグ: processed_files最初の行のデータ型: {[type(val).__name__ for val in first_row]}"
+                                            f"    sensor_dataテーブル: 合計{total_sensor_rows}行をマージします..."
                                         )
 
-                                    for row in processed_files_data:
-                                        # メインデータベースに挿入
-                                        try:
-                                            # すべての値を文字列に変換（Noneは除く、datetime型は特別処理）
-                                            import datetime
+                                        # 大量データの場合はバッチ処理
+                                        batch_size = 10000  # バッチサイズを増やす
+                                        offset = 0
+                                        rows_processed = 0
 
-                                            converted_row = []
-                                            for val in row:
-                                                if val is None:
-                                                    converted_row.append(None)
-                                                elif isinstance(val, datetime.datetime):
-                                                    # datetime型は特別に処理
-                                                    converted_row.append(
-                                                        val.isoformat()
-                                                    )
-                                                else:
-                                                    # その他の型は通常の文字列変換
-                                                    converted_row.append(str(val))
-                                            self.db_manager.execute(
-                                                """
-                                                INSERT OR REPLACE INTO processed_files 
-                                                (file_path, file_hash, source_zip, processed_date, status, status_updated_at)
-                                                VALUES (?, ?, ?, ?, ?, ?)
-                                                """,
-                                                converted_row,
+                                        while offset < total_sensor_rows:
+                                            # バッチごとにデータをコピー
+                                            batch_query = f"""
+                                                INSERT INTO main.sensor_data 
+                                                SELECT * FROM {temp_db_name}.sensor_data 
+                                                LIMIT {batch_size} OFFSET {offset}
+                                            """
+                                            main_conn.execute(batch_query)
+
+                                            # 進捗を更新
+                                            offset += batch_size
+                                            rows_processed += min(
+                                                batch_size,
+                                                total_sensor_rows
+                                                - (offset - batch_size),
                                             )
-                                        except Exception as e:
+                                            progress = min(
+                                                100,
+                                                int(
+                                                    rows_processed
+                                                    * 100
+                                                    / total_sensor_rows
+                                                ),
+                                            )
                                             print(
-                                                f"  警告: processed_filesデータのマージ中にエラー: {str(e)}"
+                                                f"    進捗: {progress}% ({rows_processed}/{total_sensor_rows}行)"
                                             )
 
-                                # sensor_dataテーブルのデータをマージ
-                                # 大量データの場合はバッチ処理が必要かもしれませんが、ここではシンプルに実装
-                                sensor_data = temp_db_manager.execute(
-                                    "SELECT * FROM sensor_data"
-                                ).fetchall()
-
-                                if sensor_data:
-                                    # デバッグ情報：最初の行のデータ型を出力
-                                    if sensor_data and len(sensor_data) > 0:
-                                        first_row = sensor_data[0]
+                                        total_rows_merged += total_sensor_rows
                                         print(
-                                            f"  デバッグ: sensor_data最初の行のデータ型: {[type(val).__name__ for val in first_row]}"
-                                        )
-                                        print(
-                                            f"  デバッグ: sensor_data最初の行の値: {first_row}"
+                                            f"    sensor_dataテーブル: {total_sensor_rows}行のマージが完了しました"
                                         )
 
-                                    # カラム名を取得（col[1] にカラム名が格納されている）
-                                    columns = [
-                                        col[1]
-                                        for col in temp_db_manager.execute(
-                                            "PRAGMA table_info(sensor_data)"
-                                        ).fetchall()
-                                    ]
-                                    placeholders = ", ".join(["?"] * len(columns))
-                                    columns_str = ", ".join(columns)
+                                    # トランザクションをコミット
+                                    main_conn.execute("COMMIT")
+                                    print(
+                                        f"    データベース {idx}/{total_dbs} のマージが完了しました"
+                                    )
 
-                                    # バッチ処理のためのリスト
-                                    batch_rows = []
-                                    batch_size = 100  # 一度に処理する行数
+                                except Exception as e:
+                                    # エラーが発生した場合はロールバック
+                                    main_conn.execute("ROLLBACK")
+                                    print(
+                                        f"    エラー: データベースマージ中に例外が発生しました: {str(e)}"
+                                    )
+                                    raise
 
-                                    for row in sensor_data:
-                                        try:
-                                            # すべての値を文字列に変換（Noneは除く、datetime型は特別処理）
-                                            import datetime
-
-                                            converted_row = []
-                                            for val in row:
-                                                if val is None:
-                                                    converted_row.append(None)
-                                                elif isinstance(val, datetime.datetime):
-                                                    # datetime型は特別に処理
-                                                    converted_row.append(
-                                                        val.isoformat()
-                                                    )
-                                                else:
-                                                    # その他の型は通常の文字列変換
-                                                    converted_row.append(str(val))
-
-                                            # バッチに追加
-                                            batch_rows.append(converted_row)
-
-                                            # バッチサイズに達したら処理
-                                            if len(batch_rows) >= batch_size:
-                                                try:
-                                                    # バッチ挿入
-                                                    for batch_row in batch_rows:
-                                                        self.db_manager.execute(
-                                                            f"INSERT INTO sensor_data ({columns_str}) VALUES ({placeholders})",
-                                                            batch_row,
-                                                        )
-                                                    batch_rows = []  # バッチをクリア
-                                                except Exception as e:
-                                                    print(
-                                                        f"  警告: sensor_dataバッチ挿入中にエラー: {str(e)}"
-                                                    )
-                                        except Exception as e:
-                                            print(
-                                                f"  警告: sensor_dataデータの変換中にエラー: {str(e)}"
-                                            )
-
-                                    # 残りのバッチを処理
-                                    if batch_rows:
-                                        try:
-                                            for batch_row in batch_rows:
-                                                self.db_manager.execute(
-                                                    f"INSERT INTO sensor_data ({columns_str}) VALUES ({placeholders})",
-                                                    batch_row,
-                                                )
-                                        except Exception as e:
-                                            print(
-                                                f"  警告: sensor_data残りのバッチ挿入中にエラー: {str(e)}"
-                                            )
-
-                                # 一時データベース接続を閉じる
-                                temp_db_manager.close()
+                                finally:
+                                    # 一時データベースをデタッチ
+                                    try:
+                                        main_conn.execute(
+                                            f"DETACH DATABASE {temp_db_name}"
+                                        )
+                                    except Exception as e:
+                                        print(
+                                            f"    警告: データベースのデタッチに失敗しました: {str(e)}"
+                                        )
 
                                 # 一時データベースファイルを削除
                                 try:
                                     os.remove(temp_db_path)
                                     print(
-                                        f"  一時データベース {os.path.basename(temp_db_path)} を削除しました"
+                                        f"    一時データベース {os.path.basename(temp_db_path)} を削除しました"
                                     )
                                 except Exception as e:
                                     print(
-                                        f"  警告: 一時データベースファイルの削除中にエラー: {str(e)}"
+                                        f"    警告: 一時データベースファイルの削除中にエラー: {str(e)}"
                                     )
 
                                 merged_count += 1
+
                             except Exception as e:
                                 print(
                                     f"  警告: 一時データベース {temp_db_path} からのマージ中にエラー: {str(e)}"
                                 )
 
-                        # メインデータベースの変更をコミット
-                        self.db_manager.commit()
+                        # 最終結果を表示
                         print(
-                            f"{merged_count}個の一時データベースからのマージが完了しました"
+                            f"{merged_count}/{total_dbs}個の一時データベースからのマージが完了しました"
                         )
+                        print(f"合計 {total_rows_merged} 行のデータがマージされました")
 
         finally:
             # 一時ディレクトリを削除

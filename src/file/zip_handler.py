@@ -112,11 +112,40 @@ class ZipHandler:
                     # まずそのままのパスで試す
                     logger.debug(f"パス {normalized_path} で抽出を試みます")
                     zip_ref.extract(normalized_path, output_dir_obj)
-                    # 階層構造があればそのファイルへのフルパスを返す
+
+                    # 抽出したファイルが実際に存在するか確認
                     if "/" in normalized_path:
                         extracted_path = output_dir_obj / normalized_path
+                        if not extracted_path.exists():
+                            logger.warning(
+                                f"抽出されたはずのファイルが見つかりません: {extracted_path}"
+                            )
+                            # 代替パスを試す
+                            alt_path = output_dir_obj / file_name
+                            if alt_path.exists():
+                                logger.info(
+                                    f"代替パスでファイルを見つけました: {alt_path}"
+                                )
+                                return alt_path
+                            else:
+                                logger.error(
+                                    f"抽出されたファイルが見つかりません: {extracted_path} も {alt_path} も存在しません"
+                                )
+                                raise FileNotFoundError(
+                                    f"抽出されたファイルが見つかりません: {extracted_path}"
+                                )
                         logger.info(f"ファイルを抽出しました: {extracted_path}")
                         return extracted_path
+
+                    # ファイルの存在確認
+                    if not output_path.exists():
+                        logger.warning(
+                            f"抽出されたはずのファイルが見つかりません: {output_path}"
+                        )
+                        raise FileNotFoundError(
+                            f"抽出されたファイルが見つかりません: {output_path}"
+                        )
+
                     logger.info(f"ファイルを抽出しました: {output_path}")
                     return output_path
                 except KeyError:
@@ -124,6 +153,7 @@ class ZipHandler:
                     logger.debug(
                         f"パス {normalized_path} が見つかりません。ファイル名 {file_name} で検索します"
                     )
+                    found = False
                     for zip_info in zip_ref.infolist():
                         zip_file_path = zip_info.filename.replace("\\", "/")
                         if (
@@ -135,11 +165,41 @@ class ZipHandler:
                                 f"ファイル名 {file_name} に一致するファイルを見つけました: {zip_file_path}"
                             )
                             zip_ref.extract(zip_info, output_dir_obj)
+                            found = True
+
                             # 抽出されたファイルのパスを返す
                             if "/" in zip_info.filename:
                                 extracted_path = output_dir_obj / zip_info.filename
+                                # ファイルの存在確認
+                                if not extracted_path.exists():
+                                    logger.warning(
+                                        f"抽出されたはずのファイルが見つかりません: {extracted_path}"
+                                    )
+                                    # 代替パスを試す
+                                    if output_path.exists():
+                                        logger.info(
+                                            f"代替パスでファイルを見つけました: {output_path}"
+                                        )
+                                        return output_path
+                                    else:
+                                        logger.error(
+                                            f"抽出されたファイルが見つかりません: {extracted_path} も {output_path} も存在しません"
+                                        )
+                                        raise FileNotFoundError(
+                                            f"抽出されたファイルが見つかりません: {extracted_path}"
+                                        )
                                 logger.info(f"ファイルを抽出しました: {extracted_path}")
                                 return extracted_path
+
+                            # ファイルの存在確認
+                            if not output_path.exists():
+                                logger.warning(
+                                    f"抽出されたはずのファイルが見つかりません: {output_path}"
+                                )
+                                raise FileNotFoundError(
+                                    f"抽出されたファイルが見つかりません: {output_path}"
+                                )
+
                             logger.info(f"ファイルを抽出しました: {output_path}")
                             return output_path
 

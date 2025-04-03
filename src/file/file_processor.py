@@ -21,6 +21,10 @@ from src.db.db_utils import DatabaseManager
 from src.file.file_utils import FileFinder, FileHasher
 from src.file.zip_handler import ZipHandler
 from src.processor.csv_processor import CsvProcessor
+from src.utils.logging_config import get_logger
+
+# ロガーの取得
+logger = get_logger("file_processor")
 
 
 # スタンドアロン関数（プロセス間で共有しない）
@@ -448,11 +452,30 @@ class FileProcessor:
                         actual_file_path = ZipHandler.extract_file(
                             source_zip, file_path, temp_dir
                         )
+                        # 抽出したファイルが存在するか確認
+                        if not Path(actual_file_path).exists():
+                            logger.error(
+                                f"抽出されたファイルが見つかりません: {actual_file_path}"
+                            )
+                            stats["failed"] += 1
+                            continue
                     else:
                         actual_file_path = file_path
+                        # 通常のファイルが存在するか確認
+                        if not Path(actual_file_path).exists():
+                            logger.error(
+                                f"ファイルが見つかりません: {actual_file_path}"
+                            )
+                            stats["failed"] += 1
+                            continue
 
                     # ファイルハッシュを計算
-                    file_hash = FileHasher.get_file_hash(actual_file_path)
+                    try:
+                        file_hash = FileHasher.get_file_hash(actual_file_path)
+                    except Exception as e:
+                        logger.error(f"ファイルハッシュ計算中にエラー: {str(e)}")
+                        stats["failed"] += 1
+                        continue
 
                     # ハッシュベースで既に処理済みかチェック
                     if not process_all and self.db_manager.is_file_processed_by_hash(
